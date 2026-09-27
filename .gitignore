@@ -1,0 +1,17 @@
+.DS_Store
+*.csv
+*.csv.zip
+data/
+raw/
+_freeze/
+figures/
+README_files/
+*_prepared.*
+*.rds
+*.RData
+*.parquet
+*.feather
+models/
+artifacts/
+.Rhistory
+.Rproj.user/
