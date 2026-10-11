@@ -1,0 +1,30 @@
+# Raw and prepared data
+data/raw/*
+!data/raw/.gitkeep
+data/processed/*
+!data/processed/.gitkeep
+
+# Model artifacts, predictions, and tuning results
+models/
+outputs/
+*.rds
+*.rda
+*.RData
+
+# Rendered notebook artifacts (submit the HTML separately)
+notebooks/*.html
+notebooks/*_files/
+Home_Credit_Modeling_Assignment.html
+Home_Credit_Modeling_Assignment_files/
+_freeze/
+.quarto/
+
+# R and operating-system files
+.Rhistory
+.RData
+.Ruserdata
+.Rproj.user/
+.DS_Store
+
+/.quarto/
+**/*.quarto_ipynb

@@ -1,0 +1,5 @@
+competition: home-credit-default-risk
+public_auc: 0.76135
+submission_name: "Home Credit gradient boosting model"
+submission_date: "2026-10-11"
+notes: "Public leaderboard score from Kaggle late submission."

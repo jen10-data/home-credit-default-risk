@@ -1,0 +1,1771 @@
+---
+title: "Home Credit Default Risk: Modeling"
+author: "Jenny Ngo"
+date: last-modified
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    code-fold: false
+    code-tools: true
+    number-sections: true
+    theme: cosmo
+    embed-resources: true
+execute:
+  echo: true
+  warning: false
+  message: false
+  cache: true
+params:
+  data_dir: "data/raw"
+  processed_dir: "data/processed"
+  outputs_dir: "outputs"
+  models_dir: "models"
+  cv_folds: 3
+  candidate_rows: 50000
+  tuning_rows: 5000
+  tuning_iterations: 20
+  include_supplementary: true
+  include_bureau_balance: false
+  seed: 6601
+---
+
+## Purpose and modeling approach
+
+The objective is to predict whether an applicant will have payment difficulties. Because only about 8% of applicants default, accuracy alone can reward a model that almost always predicts the majority class. I therefore use stratified three-fold cross-validation and select models using ROC AUC, the competition metric.
+
+This version is designed for a Mac with a limited R installation. It uses base R plus only `data.table`, `glmnet`, `randomForest`, `gbm`, and `knitr`. The reusable script implements preprocessing, folds, AUC, class sampling, randomized tuning, and model importance directly.
+
+The workflow prevents leakage in four ways:
+
+1. Imputation, category frequency encoding, centering, and scaling are estimated on each training fold and then applied to its validation fold.
+2. Up- or downsampling is applied only to a training fold.
+3. The competition test set is not used for model selection.
+4. Historical records are aggregated to one row per current applicant before joining.
+
+## Setup
+
+```{r}
+#| label: setup
+#| echo: true
+#| code-fold: true
+
+# This standalone notebook is intended to be saved in the project root.
+project_root <- "."
+project_path <- function(path) file.path(project_root, path)
+
+# Reusable modeling functions are embedded here so no external R script is needed.
+# Lightweight reusable modeling functions for Home Credit Default Risk.
+# External dependencies are limited to required_modeling_packages() below.
+
+`%||%` <- function(x, y) {
+  if (is.null(x) || length(x) == 0L) y else x
+}
+
+required_modeling_packages <- function() {
+  c("data.table", "glmnet", "randomForest", "gbm", "knitr")
+}
+
+check_modeling_packages <- function(packages = required_modeling_packages()) {
+  missing <- packages[!vapply(packages, requireNamespace, logical(1), quietly = TRUE)]
+  if (length(missing) > 0L) {
+    stop(
+      paste0(
+        "Missing R packages: ", paste(missing, collapse = ", "),
+        ". Install them in the R Console with: ",
+        "install.packages(c('data.table', 'glmnet', 'randomForest', 'gbm', 'knitr'))."
+      ),
+      call. = FALSE
+    )
+  }
+  invisible(TRUE)
+}
+
+default_params <- list(
+  data_dir = "data/raw",
+  processed_dir = "data/processed",
+  outputs_dir = "outputs",
+  models_dir = "models",
+  cv_folds = 3L,
+  candidate_rows = 50000L,
+  tuning_rows = 5000L,
+  tuning_iterations = 20L,
+  include_supplementary = TRUE,
+  include_bureau_balance = FALSE,
+  seed = 6601L
+)
+
+if (!exists("params", inherits = TRUE)) {
+  params <- default_params
+}
+
+initialize_modeling_session <- function(seed = 6601L) {
+  check_modeling_packages()
+  set.seed(as.integer(seed))
+  options(stringsAsFactors = FALSE)
+  invisible(TRUE)
+}
+
+ensure_project_directories <- function(outputs_dir = "outputs", models_dir = "models") {
+  dir.create(outputs_dir, recursive = TRUE, showWarnings = FALSE)
+  dir.create(models_dir, recursive = TRUE, showWarnings = FALSE)
+  invisible(list(outputs_dir = outputs_dir, models_dir = models_dir))
+}
+
+assert_columns <- function(data, required, data_name = deparse(substitute(data))) {
+  missing <- setdiff(required, names(data))
+  if (length(missing) > 0L) {
+    stop(data_name, " is missing required columns: ", paste(missing, collapse = ", "), call. = FALSE)
+  }
+  invisible(TRUE)
+}
+
+safe_divide <- function(numerator, denominator) {
+  result <- rep(NA_real_, length(numerator))
+  valid <- is.finite(numerator) & is.finite(denominator) & denominator != 0
+  result[valid] <- numerator[valid] / denominator[valid]
+  result
+}
+
+mean_or_na <- function(x) if (all(is.na(x))) NA_real_ else mean(x, na.rm = TRUE)
+max_or_na <- function(x) if (all(is.na(x))) NA_real_ else max(x, na.rm = TRUE)
+min_or_na <- function(x) if (all(is.na(x))) NA_real_ else min(x, na.rm = TRUE)
+sum_or_na <- function(x) if (all(is.na(x))) NA_real_ else sum(x, na.rm = TRUE)
+
+weighted_mean_or_na <- function(x, weights) {
+  valid <- is.finite(x) & is.finite(weights) & weights > 0
+  if (!any(valid)) NA_real_ else stats::weighted.mean(x[valid], weights[valid])
+}
+
+find_home_credit_file <- function(data_dir, file_name, required = FALSE) {
+  exact <- file.path(data_dir, file_name)
+  if (file.exists(exact)) return(exact)
+  stem <- tools::file_path_sans_ext(file_name)
+  extension <- tools::file_ext(file_name)
+  pattern <- paste0("^", stem, "(\\([0-9]+\\))?\\.", extension, "$")
+  matches <- list.files(data_dir, pattern = pattern, full.names = TRUE)
+  if (length(matches) > 0L) return(sort(matches)[[1]])
+  if (required) {
+    stop("Required file not found: ", file_name, ". Place it in ",
+         data_dir, ".", call. = FALSE)
+  }
+  NULL
+}
+
+available_home_credit_files <- function(data_dir) {
+  result <- data.frame(
+    file = c(
+      "application_train.csv", "application_test.csv", "bureau.csv",
+      "bureau_balance.csv", "previous_application.csv", "installments_payments.csv",
+      "POS_CASH_balance.csv", "credit_card_balance.csv",
+      "HomeCredit_columns_description.csv", "sample_submission.csv"
+    ),
+    grain = c(
+      "One current application", "One current application", "One external bureau credit",
+      "One month per external bureau credit", "One previous Home Credit application",
+      "One payment or missed installment", "One month per previous POS/cash loan",
+      "One month per previous credit card", "One column definition",
+      "One test-set prediction"
+    ),
+    primary_key = c(
+      "SK_ID_CURR", "SK_ID_CURR", "SK_ID_BUREAU",
+      "SK_ID_BUREAU + MONTHS_BALANCE", "SK_ID_PREV", "Composite payment record",
+      "SK_ID_PREV + MONTHS_BALANCE", "SK_ID_PREV + MONTHS_BALANCE",
+      "Table + Row", "SK_ID_CURR"
+    ),
+    join_key = c(
+      "—", "—", "SK_ID_CURR", "SK_ID_BUREAU", "SK_ID_CURR",
+      "SK_ID_PREV and SK_ID_CURR", "SK_ID_PREV and SK_ID_CURR",
+      "SK_ID_PREV and SK_ID_CURR", "—", "SK_ID_CURR"
+    ),
+    stringsAsFactors = FALSE
+  )
+  result$path <- vapply(result$file, function(x) {
+    find_home_credit_file(data_dir, x, required = FALSE) %||% NA_character_
+  }, character(1))
+  result$available <- !is.na(result$path)
+  result
+}
+
+find_application_pair <- function(raw_dir, processed_dir = "data/processed") {
+  raw_train <- find_home_credit_file(raw_dir, "application_train.csv", required = FALSE)
+  raw_test <- find_home_credit_file(raw_dir, "application_test.csv", required = FALSE)
+  train_candidates <- c(
+    file.path(processed_dir, "application_train_prepared.csv"),
+    file.path(processed_dir, "application_train_processed.csv"),
+    file.path(processed_dir, "application_train.csv"), raw_train
+  )
+  test_candidates <- c(
+    file.path(processed_dir, "application_test_prepared.csv"),
+    file.path(processed_dir, "application_test_processed.csv"),
+    file.path(processed_dir, "application_test.csv"), raw_test
+  )
+  first_existing <- function(paths) {
+    found <- paths[!is.na(paths) & file.exists(paths)]
+    if (length(found) == 0L) NULL else found[[1]]
+  }
+  train_path <- first_existing(train_candidates)
+  test_path <- first_existing(test_candidates)
+  if (is.null(train_path) || is.null(test_path)) {
+    stop(
+      paste(
+        "The notebook requires application_train.csv and application_test.csv",
+        "or prepared equivalents in data/processed. Place them in data/raw",
+        "before rendering the notebook."
+      ),
+      call. = FALSE
+    )
+  }
+  list(train = train_path, test = test_path)
+}
+
+read_application_data <- function(raw_dir = "data/raw", processed_dir = "data/processed") {
+  paths <- find_application_pair(raw_dir, processed_dir)
+  train <- data.table::fread(paths$train, data.table = FALSE, showProgress = FALSE)
+  test <- data.table::fread(paths$test, data.table = FALSE, showProgress = FALSE)
+  assert_columns(train, c("SK_ID_CURR", "TARGET"), "training data")
+  assert_columns(test, "SK_ID_CURR", "test data")
+  list(train = train, test = test, paths = paths)
+}
+
+engineer_application_features <- function(data) {
+  output <- as.data.frame(data, stringsAsFactors = FALSE)
+  if ("DAYS_EMPLOYED" %in% names(output)) {
+    output$DAYS_EMPLOYED[output$DAYS_EMPLOYED == 365243] <- NA_real_
+    output$EMPLOYED_YEARS <- abs(output$DAYS_EMPLOYED) / 365.25
+  }
+  if ("DAYS_BIRTH" %in% names(output)) output$AGE_YEARS <- abs(output$DAYS_BIRTH) / 365.25
+  if ("DAYS_REGISTRATION" %in% names(output)) {
+    output$REGISTRATION_YEARS <- abs(output$DAYS_REGISTRATION) / 365.25
+  }
+  if ("DAYS_ID_PUBLISH" %in% names(output)) {
+    output$ID_PUBLISH_YEARS <- abs(output$DAYS_ID_PUBLISH) / 365.25
+  }
+  ratio_specs <- list(
+    CREDIT_TO_INCOME = c("AMT_CREDIT", "AMT_INCOME_TOTAL"),
+    ANNUITY_TO_INCOME = c("AMT_ANNUITY", "AMT_INCOME_TOTAL"),
+    GOODS_TO_CREDIT = c("AMT_GOODS_PRICE", "AMT_CREDIT"),
+    PAYMENT_RATE = c("AMT_ANNUITY", "AMT_CREDIT"),
+    INCOME_PER_PERSON = c("AMT_INCOME_TOTAL", "CNT_FAM_MEMBERS"),
+    EMPLOYED_TO_AGE = c("EMPLOYED_YEARS", "AGE_YEARS")
+  )
+  for (new_name in names(ratio_specs)) {
+    inputs <- ratio_specs[[new_name]]
+    if (all(inputs %in% names(output))) {
+      output[[new_name]] <- safe_divide(output[[inputs[[1]]]], output[[inputs[[2]]]])
+    }
+  }
+  ext_sources <- intersect(c("EXT_SOURCE_1", "EXT_SOURCE_2", "EXT_SOURCE_3"), names(output))
+  if (length(ext_sources) > 0L) {
+    ext_matrix <- as.matrix(output[, ext_sources, drop = FALSE])
+    output$EXT_SOURCE_MEAN <- rowMeans(ext_matrix, na.rm = TRUE)
+    output$EXT_SOURCE_MEAN[!is.finite(output$EXT_SOURCE_MEAN)] <- NA_real_
+    output$EXT_SOURCE_MISSING <- rowSums(is.na(ext_matrix))
+  }
+  predictor_names <- setdiff(names(output), c("TARGET", "SK_ID_CURR"))
+  output$APPLICATION_MISSING_COUNT <- rowSums(is.na(output[, predictor_names, drop = FALSE]))
+  output
+}
+
+coerce_target <- function(train) {
+  assert_columns(train, "TARGET", "training data")
+  target <- train$TARGET
+  if (is.factor(target) || is.character(target)) {
+    target_text <- as.character(target)
+    if (all(target_text %in% c("default", "non_default"))) {
+      target <- ifelse(target_text == "default", 1L, 0L)
+    } else {
+      target <- suppressWarnings(as.integer(target_text))
+    }
+  } else {
+    target <- as.integer(target)
+  }
+  if (any(is.na(target)) || any(!target %in% c(0L, 1L))) {
+    stop("TARGET must contain only 0/1 or default/non_default.", call. = FALSE)
+  }
+  train$TARGET <- target
+  train
+}
+
+harmonize_train_test <- function(train, test) {
+  train <- coerce_target(train)
+  if ("TARGET" %in% names(test)) test$TARGET <- NULL
+  train_predictors <- setdiff(names(train), "TARGET")
+  missing_in_test <- setdiff(train_predictors, names(test))
+  for (column in missing_in_test) test[[column]] <- NA
+  extra_in_test <- setdiff(names(test), train_predictors)
+  if (length(extra_in_test) > 0L) test[extra_in_test] <- NULL
+  test <- test[, train_predictors, drop = FALSE]
+  list(train = train, test = test)
+}
+
+aggregate_bureau_features <- function(data_dir, include_balance = FALSE) {
+  bureau_path <- find_home_credit_file(data_dir, "bureau.csv", required = TRUE)
+  bureau <- data.table::fread(bureau_path, showProgress = FALSE)
+  assert_columns(bureau, c("SK_ID_CURR", "SK_ID_BUREAU"), "bureau.csv")
+  bureau <- bureau[is.na(DAYS_CREDIT) | DAYS_CREDIT <= 0]
+  bureau[, BUREAU_DEBT_RATIO_ROW := safe_divide(AMT_CREDIT_SUM_DEBT, AMT_CREDIT_SUM)]
+  bureau_features <- bureau[, .(
+    BUREAU_CREDIT_COUNT = .N,
+    BUREAU_ACTIVE_COUNT = sum(CREDIT_ACTIVE == "Active", na.rm = TRUE),
+    BUREAU_CLOSED_COUNT = sum(CREDIT_ACTIVE == "Closed", na.rm = TRUE),
+    BUREAU_BAD_DEBT_COUNT = sum(CREDIT_ACTIVE == "Bad debt", na.rm = TRUE),
+    BUREAU_ACTIVE_SHARE = mean_or_na(CREDIT_ACTIVE == "Active"),
+    BUREAU_DAYS_CREDIT_MEAN = mean_or_na(DAYS_CREDIT),
+    BUREAU_DAYS_CREDIT_OLDEST = min_or_na(DAYS_CREDIT),
+    BUREAU_DAYS_CREDIT_RECENT = max_or_na(DAYS_CREDIT),
+    BUREAU_OVERDUE_DAYS_MAX = max_or_na(CREDIT_DAY_OVERDUE),
+    BUREAU_ANY_OVERDUE_SHARE = mean_or_na(CREDIT_DAY_OVERDUE > 0),
+    BUREAU_CREDIT_SUM_TOTAL = sum_or_na(AMT_CREDIT_SUM),
+    BUREAU_CREDIT_SUM_MEAN = mean_or_na(AMT_CREDIT_SUM),
+    BUREAU_DEBT_TOTAL = sum_or_na(AMT_CREDIT_SUM_DEBT),
+    BUREAU_DEBT_RATIO_MEAN = mean_or_na(BUREAU_DEBT_RATIO_ROW),
+    BUREAU_OVERDUE_AMOUNT_MAX = max_or_na(AMT_CREDIT_SUM_OVERDUE),
+    BUREAU_PROLONG_COUNT = sum_or_na(CNT_CREDIT_PROLONG)
+  ), by = SK_ID_CURR]
+  if (!include_balance) return(as.data.frame(bureau_features))
+  balance_path <- find_home_credit_file(data_dir, "bureau_balance.csv", required = FALSE)
+  if (is.null(balance_path)) return(as.data.frame(bureau_features))
+  bureau_balance <- data.table::fread(
+    balance_path,
+    select = c("SK_ID_BUREAU", "MONTHS_BALANCE", "STATUS"),
+    showProgress = FALSE
+  )
+  bureau_balance <- bureau_balance[is.na(MONTHS_BALANCE) | MONTHS_BALANCE <= 0]
+  bureau_balance[, STATUS_NUMERIC := suppressWarnings(as.integer(STATUS))]
+  by_account <- bureau_balance[, .(
+    BB_OBSERVATIONS = .N,
+    BB_MONTHS_OLDEST = min_or_na(MONTHS_BALANCE),
+    BB_MONTHS_RECENT = max_or_na(MONTHS_BALANCE),
+    BB_CURRENT_SHARE = mean_or_na(STATUS == "C"),
+    BB_UNKNOWN_SHARE = mean_or_na(STATUS == "X"),
+    BB_DELINQUENT_SHARE = mean_or_na(STATUS %in% as.character(1:5)),
+    BB_SEVERE_DELINQUENT_SHARE = mean_or_na(STATUS %in% as.character(3:5)),
+    BB_STATUS_MAX = max_or_na(STATUS_NUMERIC)
+  ), by = SK_ID_BUREAU]
+  bureau_map <- unique(bureau[, .(SK_ID_BUREAU, SK_ID_CURR)])
+  by_account <- merge(by_account, bureau_map, by = "SK_ID_BUREAU", all.x = TRUE)
+  by_current <- by_account[!is.na(SK_ID_CURR), .(
+    BB_ACCOUNT_COUNT = .N,
+    BB_RECORDS = sum(BB_OBSERVATIONS, na.rm = TRUE),
+    BB_MONTHS_OLDEST = min_or_na(BB_MONTHS_OLDEST),
+    BB_MONTHS_RECENT = max_or_na(BB_MONTHS_RECENT),
+    BB_CURRENT_SHARE = weighted_mean_or_na(BB_CURRENT_SHARE, BB_OBSERVATIONS),
+    BB_UNKNOWN_SHARE = weighted_mean_or_na(BB_UNKNOWN_SHARE, BB_OBSERVATIONS),
+    BB_DELINQUENT_SHARE = weighted_mean_or_na(BB_DELINQUENT_SHARE, BB_OBSERVATIONS),
+    BB_SEVERE_DELINQUENT_SHARE = weighted_mean_or_na(BB_SEVERE_DELINQUENT_SHARE, BB_OBSERVATIONS),
+    BB_STATUS_MAX = max_or_na(BB_STATUS_MAX)
+  ), by = SK_ID_CURR]
+  as.data.frame(merge(bureau_features, by_current, by = "SK_ID_CURR", all.x = TRUE))
+}
+
+aggregate_credit_card_features <- function(data_dir) {
+  path <- find_home_credit_file(data_dir, "credit_card_balance.csv", required = TRUE)
+  columns <- c(
+    "SK_ID_PREV", "SK_ID_CURR", "MONTHS_BALANCE", "AMT_BALANCE",
+    "AMT_CREDIT_LIMIT_ACTUAL", "AMT_DRAWINGS_CURRENT", "AMT_INST_MIN_REGULARITY",
+    "AMT_PAYMENT_TOTAL_CURRENT", "AMT_TOTAL_RECEIVABLE", "CNT_DRAWINGS_CURRENT",
+    "NAME_CONTRACT_STATUS", "SK_DPD", "SK_DPD_DEF"
+  )
+  cc <- data.table::fread(path, select = columns, showProgress = FALSE)
+  cc <- cc[is.na(MONTHS_BALANCE) | MONTHS_BALANCE <= 0]
+  cc[, CC_UTILIZATION_ROW := safe_divide(AMT_BALANCE, AMT_CREDIT_LIMIT_ACTUAL)]
+  cc[, CC_PAYMENT_RATIO_ROW := safe_divide(AMT_PAYMENT_TOTAL_CURRENT, AMT_INST_MIN_REGULARITY)]
+  features <- cc[, .(
+    CC_RECORDS = .N,
+    CC_CONTRACT_COUNT = data.table::uniqueN(SK_ID_PREV),
+    CC_MONTHS_OLDEST = min_or_na(MONTHS_BALANCE),
+    CC_MONTHS_RECENT = max_or_na(MONTHS_BALANCE),
+    CC_BALANCE_MEAN = mean_or_na(AMT_BALANCE),
+    CC_BALANCE_MAX = max_or_na(AMT_BALANCE),
+    CC_CREDIT_LIMIT_MEAN = mean_or_na(AMT_CREDIT_LIMIT_ACTUAL),
+    CC_UTILIZATION_MEAN = mean_or_na(CC_UTILIZATION_ROW),
+    CC_UTILIZATION_MAX = max_or_na(CC_UTILIZATION_ROW),
+    CC_DRAWINGS_TOTAL = sum_or_na(AMT_DRAWINGS_CURRENT),
+    CC_DRAWING_COUNT_TOTAL = sum_or_na(CNT_DRAWINGS_CURRENT),
+    CC_PAYMENT_TOTAL = sum_or_na(AMT_PAYMENT_TOTAL_CURRENT),
+    CC_PAYMENT_RATIO_MEAN = mean_or_na(CC_PAYMENT_RATIO_ROW),
+    CC_RECEIVABLE_MEAN = mean_or_na(AMT_TOTAL_RECEIVABLE),
+    CC_DPD_MAX = max_or_na(SK_DPD),
+    CC_DPD_DEF_MAX = max_or_na(SK_DPD_DEF),
+    CC_ANY_DPD_SHARE = mean_or_na(SK_DPD > 0),
+    CC_COMPLETED_SHARE = mean_or_na(NAME_CONTRACT_STATUS == "Completed")
+  ), by = SK_ID_CURR]
+  as.data.frame(features)
+}
+
+aggregate_previous_application_features <- function(data_dir) {
+  path <- find_home_credit_file(data_dir, "previous_application.csv", required = TRUE)
+  previous <- data.table::fread(path, showProgress = FALSE)
+  assert_columns(previous, c("SK_ID_CURR", "SK_ID_PREV"), "previous_application.csv")
+  previous <- previous[is.na(DAYS_DECISION) | DAYS_DECISION <= 0]
+  previous[, PREV_CREDIT_TO_APPLICATION_ROW := safe_divide(AMT_CREDIT, AMT_APPLICATION)]
+  features <- previous[, .(
+    PREV_APPLICATION_COUNT = .N,
+    PREV_CONTRACT_COUNT = data.table::uniqueN(SK_ID_PREV),
+    PREV_APPROVED_COUNT = sum(NAME_CONTRACT_STATUS == "Approved", na.rm = TRUE),
+    PREV_REFUSED_COUNT = sum(NAME_CONTRACT_STATUS == "Refused", na.rm = TRUE),
+    PREV_APPROVED_SHARE = mean_or_na(NAME_CONTRACT_STATUS == "Approved"),
+    PREV_REFUSED_SHARE = mean_or_na(NAME_CONTRACT_STATUS == "Refused"),
+    PREV_APPLICATION_AMOUNT_MEAN = mean_or_na(AMT_APPLICATION),
+    PREV_CREDIT_AMOUNT_MEAN = mean_or_na(AMT_CREDIT),
+    PREV_ANNUITY_MEAN = mean_or_na(AMT_ANNUITY),
+    PREV_DOWN_PAYMENT_MEAN = mean_or_na(AMT_DOWN_PAYMENT),
+    PREV_CREDIT_TO_APPLICATION_MEAN = mean_or_na(PREV_CREDIT_TO_APPLICATION_ROW),
+    PREV_DAYS_DECISION_RECENT = max_or_na(DAYS_DECISION),
+    PREV_DAYS_DECISION_OLDEST = min_or_na(DAYS_DECISION),
+    PREV_CLIENT_TYPE_REPEAT_SHARE = mean_or_na(NAME_CLIENT_TYPE == "Repeater")
+  ), by = SK_ID_CURR]
+  as.data.frame(features)
+}
+
+aggregate_installment_features <- function(data_dir) {
+  path <- find_home_credit_file(data_dir, "installments_payments.csv", required = TRUE)
+  installments <- data.table::fread(path, showProgress = FALSE)
+  assert_columns(installments, c("SK_ID_CURR", "SK_ID_PREV"), "installments_payments.csv")
+  installments <- installments[
+    (is.na(DAYS_ENTRY_PAYMENT) | DAYS_ENTRY_PAYMENT <= 0) &
+      (is.na(DAYS_INSTALMENT) | DAYS_INSTALMENT <= 0)
+  ]
+  installments[, INST_DAYS_LATE_ROW := DAYS_ENTRY_PAYMENT - DAYS_INSTALMENT]
+  installments[, INST_PAYMENT_RATIO_ROW := safe_divide(AMT_PAYMENT, AMT_INSTALMENT)]
+  installments[, INST_SHORTFALL_ROW := ifelse(
+    is.na(AMT_INSTALMENT) | is.na(AMT_PAYMENT), NA_real_,
+    pmax(AMT_INSTALMENT - AMT_PAYMENT, 0)
+  )]
+  installments[, INST_DAYS_LATE_POSITIVE := ifelse(
+    is.na(INST_DAYS_LATE_ROW), NA_real_, pmax(INST_DAYS_LATE_ROW, 0)
+  )]
+  features <- installments[, .(
+    INST_RECORDS = .N,
+    INST_CONTRACT_COUNT = data.table::uniqueN(SK_ID_PREV),
+    INST_LATE_SHARE = mean_or_na(INST_DAYS_LATE_ROW > 0),
+    INST_DAYS_LATE_MEAN = mean_or_na(INST_DAYS_LATE_POSITIVE),
+    INST_DAYS_LATE_MAX = max_or_na(INST_DAYS_LATE_POSITIVE),
+    INST_PAYMENT_RATIO_MEAN = mean_or_na(INST_PAYMENT_RATIO_ROW),
+    INST_SHORTFALL_TOTAL = sum_or_na(INST_SHORTFALL_ROW),
+    INST_PAYMENT_TOTAL = sum_or_na(AMT_PAYMENT),
+    INST_AMOUNT_TOTAL = sum_or_na(AMT_INSTALMENT)
+  ), by = SK_ID_CURR]
+  as.data.frame(features)
+}
+
+aggregate_pos_cash_features <- function(data_dir) {
+  path <- find_home_credit_file(data_dir, "POS_CASH_balance.csv", required = TRUE)
+  pos <- data.table::fread(path, showProgress = FALSE)
+  assert_columns(pos, c("SK_ID_CURR", "SK_ID_PREV"), "POS_CASH_balance.csv")
+  pos <- pos[is.na(MONTHS_BALANCE) | MONTHS_BALANCE <= 0]
+  features <- pos[, .(
+    POS_RECORDS = .N,
+    POS_CONTRACT_COUNT = data.table::uniqueN(SK_ID_PREV),
+    POS_MONTHS_OLDEST = min_or_na(MONTHS_BALANCE),
+    POS_MONTHS_RECENT = max_or_na(MONTHS_BALANCE),
+    POS_DPD_MEAN = mean_or_na(SK_DPD),
+    POS_DPD_MAX = max_or_na(SK_DPD),
+    POS_DPD_DEF_MAX = max_or_na(SK_DPD_DEF),
+    POS_ANY_DPD_SHARE = mean_or_na(SK_DPD > 0),
+    POS_INSTALLMENTS_FUTURE_MEAN = mean_or_na(CNT_INSTALMENT_FUTURE),
+    POS_COMPLETED_SHARE = mean_or_na(NAME_CONTRACT_STATUS == "Completed")
+  ), by = SK_ID_CURR]
+  as.data.frame(features)
+}
+
+build_supplementary_features <- function(data_dir, include_bureau_balance = FALSE) {
+  feature_sets <- list()
+  sources <- character()
+  if (!is.null(find_home_credit_file(data_dir, "bureau.csv", required = FALSE))) {
+    feature_sets$bureau <- aggregate_bureau_features(data_dir, include_bureau_balance)
+    sources <- c(sources, "bureau.csv")
+    if (include_bureau_balance &&
+        !is.null(find_home_credit_file(data_dir, "bureau_balance.csv", required = FALSE))) {
+      sources <- c(sources, "bureau_balance.csv")
+    }
+  }
+  if (!is.null(find_home_credit_file(data_dir, "previous_application.csv", required = FALSE))) {
+    feature_sets$previous <- aggregate_previous_application_features(data_dir)
+    sources <- c(sources, "previous_application.csv")
+  }
+  if (!is.null(find_home_credit_file(data_dir, "installments_payments.csv", required = FALSE))) {
+    feature_sets$installments <- aggregate_installment_features(data_dir)
+    sources <- c(sources, "installments_payments.csv")
+  }
+  if (!is.null(find_home_credit_file(data_dir, "POS_CASH_balance.csv", required = FALSE))) {
+    feature_sets$pos <- aggregate_pos_cash_features(data_dir)
+    sources <- c(sources, "POS_CASH_balance.csv")
+  }
+  if (!is.null(find_home_credit_file(data_dir, "credit_card_balance.csv", required = FALSE))) {
+    feature_sets$credit_card <- aggregate_credit_card_features(data_dir)
+    sources <- c(sources, "credit_card_balance.csv")
+  }
+  if (length(feature_sets) == 0L) return(NULL)
+  combined <- Reduce(
+    function(x, y) merge(x, y, by = "SK_ID_CURR", all = TRUE, sort = FALSE),
+    feature_sets
+  )
+  attr(combined, "sources") <- sources
+  combined
+}
+
+load_or_build_supplementary_features <- function(
+    data_dir, cache_path, include_bureau_balance = FALSE) {
+  if (file.exists(cache_path)) {
+    cached <- data.table::fread(cache_path, data.table = FALSE, showProgress = FALSE)
+    attr(cached, "sources") <- "Cached aggregate file"
+    return(cached)
+  }
+  features <- build_supplementary_features(data_dir, include_bureau_balance)
+  if (!is.null(features)) {
+    dir.create(dirname(cache_path), recursive = TRUE, showWarnings = FALSE)
+    data.table::fwrite(features, cache_path)
+  }
+  features
+}
+
+add_history_availability <- function(data) {
+  prefix_map <- c(
+    BUREAU = "BUREAU_", BUREAU_BALANCE = "BB_", PREVIOUS = "PREV_",
+    INSTALLMENTS = "INST_", POS_CASH = "POS_", CREDIT_CARD = "CC_"
+  )
+  output <- data
+  for (label in names(prefix_map)) {
+    columns <- grep(paste0("^", prefix_map[[label]]), names(output), value = TRUE)
+    if (length(columns) == 0L) next
+    output[[paste0("HAS_", label, "_HISTORY")]] <- as.integer(
+      rowSums(!is.na(output[, columns, drop = FALSE])) > 0L
+    )
+  }
+  count_columns <- grep("(_COUNT|_RECORDS|_OBSERVATIONS)$", names(output), value = TRUE)
+  for (column in count_columns) output[[column]][is.na(output[[column]])] <- 0
+  output
+}
+
+left_join_by_id <- function(data, features, id = "SK_ID_CURR") {
+  if (is.null(features)) return(data)
+  feature_columns <- setdiff(names(features), id)
+  positions <- match(data[[id]], features[[id]])
+  joined <- cbind(data, features[positions, feature_columns, drop = FALSE])
+  rownames(joined) <- NULL
+  joined
+}
+
+join_supplementary_features <- function(train, test, supplementary) {
+  if (is.null(supplementary)) return(list(train = train, test = test))
+  list(
+    train = add_history_availability(left_join_by_id(train, supplementary)),
+    test = add_history_availability(left_join_by_id(test, supplementary))
+  )
+}
+
+default_basic_predictors <- function(data) {
+  candidates <- c(
+    "EXT_SOURCE_1", "EXT_SOURCE_2", "EXT_SOURCE_3", "EXT_SOURCE_MEAN",
+    "AGE_YEARS", "EMPLOYED_YEARS", "AMT_INCOME_TOTAL", "AMT_CREDIT",
+    "AMT_ANNUITY", "AMT_GOODS_PRICE", "CREDIT_TO_INCOME",
+    "ANNUITY_TO_INCOME", "PAYMENT_RATE", "INCOME_PER_PERSON",
+    "NAME_EDUCATION_TYPE", "NAME_INCOME_TYPE", "NAME_FAMILY_STATUS",
+    "NAME_HOUSING_TYPE", "OCCUPATION_TYPE", "ORGANIZATION_TYPE",
+    "CODE_GENDER", "FLAG_OWN_CAR", "FLAG_OWN_REALTY",
+    "REGION_RATING_CLIENT", "REGION_RATING_CLIENT_W_CITY"
+  )
+  intersect(candidates, names(data))
+}
+
+predictor_names_for_set <- function(data, predictor_set = c("full", "basic")) {
+  predictor_set <- match.arg(predictor_set)
+  if (predictor_set == "basic") return(default_basic_predictors(data))
+  setdiff(names(data), c("TARGET", "SK_ID_CURR"))
+}
+
+encode_column_fit <- function(x) {
+  if (is.numeric(x) || is.integer(x) || is.logical(x)) {
+    values <- as.numeric(x)
+    values[!is.finite(values)] <- NA_real_
+    median_value <- if (all(is.na(values))) 0 else stats::median(values, na.rm = TRUE)
+    values[is.na(values)] <- median_value
+    return(list(kind = "numeric", median = median_value, values = values))
+  }
+  values <- as.character(x)
+  values[is.na(values) | values == ""] <- "__MISSING__"
+  frequencies <- table(values) / length(values)
+  encoded <- as.numeric(frequencies[values])
+  list(kind = "categorical", frequencies = frequencies, values = encoded)
+}
+
+fit_preprocessor <- function(data, predictor_set = c("full", "basic")) {
+  predictor_set <- match.arg(predictor_set)
+  predictors <- predictor_names_for_set(data, predictor_set)
+  if (length(predictors) == 0L) stop("No predictors were available.", call. = FALSE)
+  encoded <- vector("list", length(predictors))
+  names(encoded) <- predictors
+  matrix_data <- matrix(0, nrow = nrow(data), ncol = length(predictors))
+  colnames(matrix_data) <- make.names(predictors, unique = TRUE)
+  for (index in seq_along(predictors)) {
+    specification <- encode_column_fit(data[[predictors[[index]]]])
+    matrix_data[, index] <- specification$values
+    specification$values <- NULL
+    encoded[[index]] <- specification
+  }
+  centers <- colMeans(matrix_data)
+  second_moment <- colMeans(matrix_data^2)
+  scales <- sqrt(pmax(second_moment - centers^2, 0))
+  keep <- is.finite(scales) & scales > 1e-8
+  if (!any(keep)) stop("All predictors had zero variance.", call. = FALSE)
+  list(
+    predictor_set = predictor_set, predictors = predictors, encoded = encoded,
+    keep = keep, feature_names = colnames(matrix_data)[keep],
+    center = centers[keep], scale = scales[keep]
+  )
+}
+
+transform_preprocessor <- function(preprocessor, data) {
+  missing <- setdiff(preprocessor$predictors, names(data))
+  if (length(missing) > 0L) for (column in missing) data[[column]] <- NA
+  matrix_data <- matrix(0, nrow = nrow(data), ncol = length(preprocessor$predictors))
+  colnames(matrix_data) <- make.names(preprocessor$predictors, unique = TRUE)
+  for (index in seq_along(preprocessor$predictors)) {
+    column <- preprocessor$predictors[[index]]
+    specification <- preprocessor$encoded[[index]]
+    if (specification$kind == "numeric") {
+      values <- suppressWarnings(as.numeric(data[[column]]))
+      values[!is.finite(values)] <- NA_real_
+      values[is.na(values)] <- specification$median
+    } else {
+      values_text <- as.character(data[[column]])
+      values_text[is.na(values_text) | values_text == ""] <- "__MISSING__"
+      values <- as.numeric(specification$frequencies[values_text])
+      values[is.na(values)] <- 0
+    }
+    matrix_data[, index] <- values
+  }
+  matrix_data <- matrix_data[, preprocessor$keep, drop = FALSE]
+  matrix_data <- sweep(matrix_data, 2L, preprocessor$center, "-")
+  matrix_data <- sweep(matrix_data, 2L, preprocessor$scale, "/")
+  matrix_data[!is.finite(matrix_data)] <- 0
+  matrix_data
+}
+
+stratified_sample_rows <- function(data, n, seed = 6601L) {
+  n <- min(as.integer(n), nrow(data))
+  if (n >= nrow(data)) return(data)
+  set.seed(seed)
+  classes <- sort(unique(data$TARGET))
+  counts <- table(factor(data$TARGET, levels = classes))
+  exact <- n * as.numeric(counts) / sum(counts)
+  allocation <- floor(exact)
+  remainder <- n - sum(allocation)
+  if (remainder > 0L) {
+    priority <- order(exact - allocation, decreasing = TRUE)
+    allocation[priority[seq_len(remainder)]] <- allocation[priority[seq_len(remainder)]] + 1L
+  }
+  indices <- unlist(lapply(seq_along(classes), function(i) {
+    candidates <- which(data$TARGET == classes[[i]])
+    sample(candidates, allocation[[i]], replace = FALSE)
+  }), use.names = FALSE)
+  data[sample(indices), , drop = FALSE]
+}
+
+make_stratified_folds <- function(target, v = 3L, seed = 6601L) {
+  set.seed(seed)
+  folds <- integer(length(target))
+  for (value in sort(unique(target))) {
+    indices <- sample(which(target == value))
+    folds[indices] <- rep(seq_len(v), length.out = length(indices))
+  }
+  folds
+}
+
+roc_auc_score <- function(truth, probability) {
+  truth <- as.integer(truth)
+  valid <- is.finite(probability) & !is.na(truth)
+  truth <- truth[valid]
+  probability <- probability[valid]
+  positive <- truth == 1L
+  n_positive <- sum(positive)
+  n_negative <- sum(!positive)
+  if (n_positive == 0L || n_negative == 0L) return(NA_real_)
+  ranks <- rank(probability, ties.method = "average")
+  (sum(ranks[positive]) - n_positive * (n_positive + 1) / 2) /
+    (n_positive * n_negative)
+}
+
+pr_auc_score <- function(truth, probability) {
+  truth <- as.integer(truth)
+  valid <- is.finite(probability) & !is.na(truth)
+  truth <- truth[valid]
+  probability <- probability[valid]
+  if (sum(truth == 1L) == 0L) return(NA_real_)
+  order_index <- order(probability, decreasing = TRUE)
+  ordered_truth <- truth[order_index]
+  cumulative_positive <- cumsum(ordered_truth == 1L)
+  precision <- cumulative_positive / seq_along(ordered_truth)
+  mean(precision[ordered_truth == 1L])
+}
+
+classification_metrics <- function(truth, probability, threshold = 0.5) {
+  prediction <- as.integer(probability >= threshold)
+  true_positive <- sum(prediction == 1L & truth == 1L)
+  true_negative <- sum(prediction == 0L & truth == 0L)
+  false_positive <- sum(prediction == 1L & truth == 0L)
+  false_negative <- sum(prediction == 0L & truth == 1L)
+  data.frame(
+    roc_auc = roc_auc_score(truth, probability),
+    pr_auc = pr_auc_score(truth, probability),
+    accuracy = mean(prediction == truth),
+    sensitivity = if ((true_positive + false_negative) == 0) NA_real_ else
+      true_positive / (true_positive + false_negative),
+    specificity = if ((true_negative + false_positive) == 0) NA_real_ else
+      true_negative / (true_negative + false_positive)
+  )
+}
+
+baseline_metrics <- function(train) {
+  train <- coerce_target(train)
+  default_rate <- mean(train$TARGET == 1L)
+  data.frame(
+    model_label = "Majority-class classifier",
+    metric = c("Accuracy", "ROC AUC", "PR AUC"),
+    estimate = c(1 - default_rate, 0.5, default_rate),
+    meaning = c(
+      "Predict every applicant as non-default.",
+      "Constant scores have no ranking ability.",
+      "For a constant ranking, precision equals event prevalence."
+    ),
+    stringsAsFactors = FALSE
+  )
+}
+
+balance_training_data <- function(x, y, strategy = c("none", "downsample", "upsample"), seed = 6601L) {
+  strategy <- match.arg(strategy)
+  if (strategy == "none") return(list(x = x, y = y))
+  set.seed(seed)
+  negative <- which(y == 0L)
+  positive <- which(y == 1L)
+  if (length(negative) == 0L || length(positive) == 0L) {
+    stop("Both target classes are required for balancing.", call. = FALSE)
+  }
+  if (strategy == "downsample") {
+    size <- min(length(negative), length(positive))
+    indices <- c(sample(negative, size), sample(positive, size))
+  } else {
+    size <- max(length(negative), length(positive))
+    indices <- c(
+      sample(negative, size, replace = length(negative) < size),
+      sample(positive, size, replace = length(positive) < size)
+    )
+  }
+  indices <- sample(indices)
+  list(x = x[indices, , drop = FALSE], y = y[indices])
+}
+
+candidate_registry <- function() {
+  data.frame(
+    model_id = c(
+      "logistic_basic_none", "elastic_net_full_none", "random_forest_full_none",
+      "gbm_full_none", "gbm_full_downsample", "gbm_full_upsample"
+    ),
+    model_label = c(
+      "Logistic regression: basic predictors", "Elastic-net logistic regression",
+      "Random forest", "Gradient boosting", "Gradient boosting with downsampling",
+      "Gradient boosting with upsampling"
+    ),
+    algorithm = c("logistic", "elastic_net", "random_forest", "gbm", "gbm", "gbm"),
+    predictor_set = c("basic", "full", "full", "full", "full", "full"),
+    imbalance = c("none", "none", "none", "none", "downsample", "upsample"),
+    stringsAsFactors = FALSE
+  )
+}
+
+default_model_parameters <- function(algorithm, predictor_count) {
+  if (algorithm == "logistic") return(list(maxit = 100L))
+  if (algorithm == "elastic_net") return(list(alpha = 0.5, lambda = 0.01))
+  if (algorithm == "random_forest") {
+    return(list(
+      ntree = 300L,
+      mtry = max(2L, min(predictor_count, round(sqrt(predictor_count)))),
+      nodesize = 20L
+    ))
+  }
+  if (algorithm == "gbm") {
+    return(list(
+      n.trees = 400L, interaction.depth = 5L, shrinkage = 0.05,
+      n.minobsinnode = 20L, bag.fraction = 0.8
+    ))
+  }
+  stop("Unsupported algorithm: ", algorithm, call. = FALSE)
+}
+
+fit_algorithm <- function(x, y, algorithm, parameters = NULL, seed = 6601L) {
+  set.seed(seed)
+  parameters <- parameters %||% default_model_parameters(algorithm, ncol(x))
+  if (algorithm == "logistic") {
+    design <- cbind(`(Intercept)` = 1, x)
+    fitted <- suppressWarnings(stats::glm.fit(
+      x = design, y = y, family = stats::binomial(),
+      control = stats::glm.control(maxit = parameters$maxit %||% 100L)
+    ))
+    coefficients <- fitted$coefficients
+    coefficients[!is.finite(coefficients)] <- 0
+    return(list(algorithm = algorithm, fit = fitted, coefficients = coefficients, parameters = parameters))
+  }
+  if (algorithm == "elastic_net") {
+    fitted <- glmnet::glmnet(
+      x = x, y = y, family = "binomial", alpha = parameters$alpha,
+      lambda = parameters$lambda, standardize = FALSE
+    )
+    return(list(algorithm = algorithm, fit = fitted, parameters = parameters))
+  }
+  if (algorithm == "random_forest") {
+    fitted <- randomForest::randomForest(
+      x = x, y = factor(y, levels = c(0, 1)), ntree = as.integer(parameters$ntree),
+      mtry = as.integer(min(parameters$mtry, ncol(x))),
+      nodesize = as.integer(parameters$nodesize), importance = TRUE
+    )
+    return(list(algorithm = algorithm, fit = fitted, parameters = parameters))
+  }
+  if (algorithm == "gbm") {
+    fitted <- gbm::gbm.fit(
+      x = x, y = y, distribution = "bernoulli",
+      n.trees = as.integer(parameters$n.trees),
+      interaction.depth = as.integer(parameters$interaction.depth),
+      n.minobsinnode = as.integer(parameters$n.minobsinnode),
+      shrinkage = parameters$shrinkage, bag.fraction = parameters$bag.fraction,
+      nTrain = nrow(x), 
+      keep.data = FALSE, 
+      verbose = FALSE
+    )
+    return(list(algorithm = algorithm, fit = fitted, parameters = parameters))
+  }
+  stop("Unsupported algorithm: ", algorithm, call. = FALSE)
+}
+
+predict_algorithm <- function(model, new_x) {
+  if (model$algorithm == "logistic") {
+    design <- cbind(`(Intercept)` = 1, new_x)
+    probability <- stats::plogis(drop(design %*% model$coefficients))
+  } else if (model$algorithm == "elastic_net") {
+    probability <- drop(stats::predict(
+      model$fit, newx = new_x, s = model$parameters$lambda, type = "response"
+    ))
+  } else if (model$algorithm == "random_forest") {
+    probability <- stats::predict(model$fit, newdata = new_x, type = "prob")[, "1"]
+  } else if (model$algorithm == "gbm") {
+    probability <- drop(stats::predict(
+      model$fit, newdata = new_x, n.trees = model$parameters$n.trees,
+      type = "response"
+    ))
+  } else {
+    stop("Unsupported algorithm: ", model$algorithm, call. = FALSE)
+  }
+  pmin(pmax(as.numeric(probability), 1e-7), 1 - 1e-7)
+}
+
+cross_validate_config <- function(data, config, v = 3L, seed = 6601L) {
+  folds <- make_stratified_folds(data$TARGET, v = v, seed = seed)
+  fold_metrics <- vector("list", v)
+  predictions <- vector("list", v)
+  for (fold in seq_len(v)) {
+    analysis_rows <- folds != fold
+    assessment_rows <- folds == fold
+    preprocessor <- fit_preprocessor(
+      data[analysis_rows, , drop = FALSE], config$predictor_set[[1]]
+    )
+    analysis_x <- transform_preprocessor(preprocessor, data[analysis_rows, , drop = FALSE])
+    assessment_x <- transform_preprocessor(preprocessor, data[assessment_rows, , drop = FALSE])
+    analysis_y <- data$TARGET[analysis_rows]
+    assessment_y <- data$TARGET[assessment_rows]
+    balanced <- balance_training_data(
+      analysis_x, analysis_y, config$imbalance[[1]], seed + fold
+    )
+    fitted <- fit_algorithm(
+      balanced$x, balanced$y, config$algorithm[[1]], seed = seed + fold
+    )
+    probability <- predict_algorithm(fitted, assessment_x)
+    metrics <- classification_metrics(assessment_y, probability)
+    metrics$model_id <- config$model_id[[1]]
+    metrics$fold <- fold
+    fold_metrics[[fold]] <- metrics
+    predictions[[fold]] <- data.frame(
+      row_index = which(assessment_rows), fold = fold, truth = assessment_y,
+      probability = probability, model_id = config$model_id[[1]]
+    )
+    rm(preprocessor, analysis_x, assessment_x, balanced, fitted)
+    invisible(gc())
+  }
+  list(
+    fold_metrics = do.call(rbind, fold_metrics),
+    predictions = do.call(rbind, predictions)
+  )
+}
+
+summarize_fold_metrics <- function(fold_metrics, registry = candidate_registry()) {
+  metric_names <- c("roc_auc", "pr_auc", "accuracy", "sensitivity", "specificity")
+  model_ids <- unique(fold_metrics$model_id)
+  rows <- lapply(model_ids, function(model_id) {
+    subset <- fold_metrics[fold_metrics$model_id == model_id, , drop = FALSE]
+    output <- data.frame(model_id = model_id, stringsAsFactors = FALSE)
+    for (metric in metric_names) {
+      output[[paste0("mean_", metric)]] <- mean(subset[[metric]], na.rm = TRUE)
+      output[[paste0("se_", metric)]] <- stats::sd(subset[[metric]], na.rm = TRUE) /
+        sqrt(sum(!is.na(subset[[metric]])))
+    }
+    output
+  })
+  summary <- do.call(rbind, rows)
+  summary <- merge(
+    registry[, c("model_id", "model_label", "algorithm", "predictor_set", "imbalance")],
+    summary, by = "model_id", all.y = TRUE, sort = FALSE
+  )
+  summary[order(summary$mean_roc_auc, decreasing = TRUE), , drop = FALSE]
+}
+
+evaluate_candidates <- function(data, registry = candidate_registry(), v = 3L, seed = 6601L) {
+  results <- vector("list", nrow(registry))
+  names(results) <- registry$model_id
+  for (index in seq_len(nrow(registry))) {
+    message("Evaluating ", registry$model_label[[index]], "...")
+    results[[index]] <- cross_validate_config(
+      data, registry[index, , drop = FALSE], v = v, seed = seed
+    )
+  }
+  fold_metrics <- do.call(rbind, lapply(results, `[[`, "fold_metrics"))
+  predictions <- do.call(rbind, lapply(results, `[[`, "predictions"))
+  list(
+    results = results, fold_metrics = fold_metrics, predictions = predictions,
+    summary = summarize_fold_metrics(fold_metrics, registry)
+  )
+}
+
+best_candidate_config <- function(summary, registry = candidate_registry()) {
+  best_id <- summary$model_id[[which.max(summary$mean_roc_auc)]]
+  registry[registry$model_id == best_id, , drop = FALSE]
+}
+
+tuning_target_config <- function(best_config) {
+  output <- best_config
+  if (output$algorithm[[1]] == "logistic") {
+    output$algorithm[[1]] <- "elastic_net"
+    output$model_label[[1]] <- "Elastic-net extension of the best logistic model"
+  }
+  output
+}
+
+random_parameter_grid <- function(algorithm, size, predictor_count, seed = 6601L) {
+  set.seed(seed)
+  size <- as.integer(size)
+  if (algorithm == "elastic_net") {
+    return(data.frame(
+      config_id = seq_len(size), alpha = stats::runif(size, 0, 1),
+      lambda = 10^stats::runif(size, -5, -1)
+    ))
+  }
+  if (algorithm == "random_forest") {
+    return(data.frame(
+      config_id = seq_len(size),
+      ntree = sample(seq(200L, 800L, by = 25L), size, replace = TRUE),
+      mtry = sample(seq_len(max(2L, min(80L, predictor_count))), size, replace = TRUE),
+      nodesize = sample(5:50, size, replace = TRUE)
+    ))
+  }
+  if (algorithm == "gbm") {
+    return(data.frame(
+      config_id = seq_len(size),
+      n.trees = sample(seq(200L, 1000L, by = 25L), size, replace = TRUE),
+      interaction.depth = sample(2:8, size, replace = TRUE),
+      shrinkage = exp(stats::runif(size, log(0.01), log(0.15))),
+      n.minobsinnode = sample(5:40, size, replace = TRUE),
+      bag.fraction = stats::runif(size, 0.6, 1.0)
+    ))
+  }
+  stop("No tuning grid is defined for: ", algorithm, call. = FALSE)
+}
+
+prepare_cv_matrices <- function(data, config, v = 3L, seed = 6601L) {
+  folds <- make_stratified_folds(data$TARGET, v = v, seed = seed)
+  lapply(seq_len(v), function(fold) {
+    analysis_rows <- folds != fold
+    assessment_rows <- folds == fold
+    preprocessor <- fit_preprocessor(
+      data[analysis_rows, , drop = FALSE], config$predictor_set[[1]]
+    )
+    list(
+      analysis_x = transform_preprocessor(preprocessor, data[analysis_rows, , drop = FALSE]),
+      analysis_y = data$TARGET[analysis_rows],
+      assessment_x = transform_preprocessor(preprocessor, data[assessment_rows, , drop = FALSE]),
+      assessment_y = data$TARGET[assessment_rows]
+    )
+  })
+}
+
+tune_candidate <- function(data, config, v = 3L, grid_size = 20L, seed = 6601L) {
+  cv_data <- prepare_cv_matrices(data, config, v = v, seed = seed)
+  grid <- random_parameter_grid(
+    config$algorithm[[1]], grid_size, ncol(cv_data[[1]]$analysis_x), seed
+  )
+  fold_rows <- vector("list", nrow(grid) * v)
+  position <- 1L
+  for (grid_row in seq_len(nrow(grid))) {
+    parameters <- as.list(grid[grid_row, setdiff(names(grid), "config_id"), drop = FALSE])
+    message("Tuning configuration ", grid_row, " of ", nrow(grid), "...")
+    for (fold in seq_len(v)) {
+      balanced <- balance_training_data(
+        cv_data[[fold]]$analysis_x, cv_data[[fold]]$analysis_y,
+        config$imbalance[[1]], seed + grid_row * 100L + fold
+      )
+      fitted <- fit_algorithm(
+        balanced$x, balanced$y, config$algorithm[[1]], parameters,
+        seed + grid_row * 100L + fold
+      )
+      probability <- predict_algorithm(fitted, cv_data[[fold]]$assessment_x)
+      metrics <- classification_metrics(cv_data[[fold]]$assessment_y, probability)
+      metrics$config_id <- grid$config_id[[grid_row]]
+      metrics$fold <- fold
+      fold_rows[[position]] <- metrics
+      position <- position + 1L
+      rm(balanced, fitted)
+      invisible(gc())
+    }
+  }
+  fold_metrics <- do.call(rbind, fold_rows)
+  config_ids <- unique(fold_metrics$config_id)
+  summary_rows <- lapply(config_ids, function(config_id) {
+    subset <- fold_metrics[fold_metrics$config_id == config_id, , drop = FALSE]
+    data.frame(
+      config_id = config_id,
+      mean_roc_auc = mean(subset$roc_auc, na.rm = TRUE),
+      se_roc_auc = stats::sd(subset$roc_auc, na.rm = TRUE) /
+        sqrt(sum(!is.na(subset$roc_auc))),
+      mean_pr_auc = mean(subset$pr_auc, na.rm = TRUE),
+      mean_accuracy = mean(subset$accuracy, na.rm = TRUE)
+    )
+  })
+  summary <- merge(grid, do.call(rbind, summary_rows), by = "config_id", sort = FALSE)
+  summary <- summary[order(summary$mean_roc_auc, decreasing = TRUE), , drop = FALSE]
+  best_id <- summary$config_id[[1]]
+  best_parameters <- as.list(
+    grid[grid$config_id == best_id, setdiff(names(grid), "config_id"), drop = FALSE]
+  )
+  list(
+    grid = grid, fold_metrics = fold_metrics, summary = summary,
+    best_parameters = best_parameters, best_auc = summary$mean_roc_auc[[1]],
+    config = config
+  )
+}
+
+fit_final_model <- function(data, config, best_parameters, seed = 6601L) {
+  preprocessor <- fit_preprocessor(data, config$predictor_set[[1]])
+  x <- transform_preprocessor(preprocessor, data)
+  balanced <- balance_training_data(x, data$TARGET, config$imbalance[[1]], seed)
+  model <- fit_algorithm(
+    balanced$x, balanced$y, config$algorithm[[1]], best_parameters, seed
+  )
+  list(preprocessor = preprocessor, model = model, config = config)
+}
+
+predict_final_model <- function(final_model, new_data) {
+  x <- transform_preprocessor(final_model$preprocessor, new_data)
+  predict_algorithm(final_model$model, x)
+}
+
+make_submission <- function(final_model, test, output_path) {
+  assert_columns(test, "SK_ID_CURR", "test data")
+  probability <- predict_final_model(final_model, test)
+  submission <- data.frame(SK_ID_CURR = test$SK_ID_CURR, TARGET = probability)
+  if (anyDuplicated(submission$SK_ID_CURR)) {
+    stop("Submission contains duplicate SK_ID_CURR values.", call. = FALSE)
+  }
+  if (any(!is.finite(submission$TARGET)) || any(submission$TARGET < 0 | submission$TARGET > 1)) {
+    stop("Submission probabilities must be finite and between 0 and 1.", call. = FALSE)
+  }
+  dir.create(dirname(output_path), recursive = TRUE, showWarnings = FALSE)
+  data.table::fwrite(submission, output_path)
+  submission
+}
+
+model_importance <- function(final_model, top_n = 20L) {
+  algorithm <- final_model$model$algorithm
+  feature_names <- final_model$preprocessor$feature_names
+  if (algorithm == "logistic") {
+    values <- abs(final_model$model$coefficients[-1])
+    names(values) <- feature_names
+  } else if (algorithm == "elastic_net") {
+    coefficients <- as.matrix(stats::coef(
+      final_model$model$fit, s = final_model$model$parameters$lambda
+    ))
+    values <- abs(coefficients[-1, 1])
+    names(values) <- rownames(coefficients)[-1]
+  } else if (algorithm == "random_forest") {
+    importance <- randomForest::importance(final_model$model$fit)
+    column <- if ("MeanDecreaseGini" %in% colnames(importance)) {
+      "MeanDecreaseGini"
+    } else {
+      colnames(importance)[[ncol(importance)]]
+    }
+    values <- importance[, column]
+    names(values) <- rownames(importance)
+  } else if (algorithm == "gbm") {
+    importance <- summary(final_model$model$fit, plotit = FALSE)
+    values <- importance$rel.inf
+    names(values) <- importance$var
+  } else {
+    return(data.frame(feature = character(), importance = numeric()))
+  }
+  values <- values[is.finite(values)]
+  values <- head(sort(values, decreasing = TRUE), top_n)
+  data.frame(feature = names(values), importance = as.numeric(values),
+             stringsAsFactors = FALSE, row.names = NULL)
+}
+
+read_kaggle_score <- function(path = "config/kaggle_score.yml") {
+  if (!file.exists(path)) return(list(public_auc = NULL, notes = "Score file not found."))
+  lines <- readLines(path, warn = FALSE)
+  read_value <- function(key) {
+    line <- lines[grepl(paste0("^", key, ":"), lines)]
+    if (length(line) == 0L) return(NULL)
+    value <- trimws(sub(paste0("^", key, ":"), "", line[[1]]))
+    value <- sub('^"', "", sub('"$', "", value))
+    if (value %in% c("", "null", "NULL")) NULL else value
+  }
+  score <- read_value("public_auc")
+  list(
+    public_auc = if (is.null(score)) NULL else as.numeric(score),
+    submission_name = read_value("submission_name"),
+    submission_date = read_value("submission_date"),
+    notes = read_value("notes")
+  )
+}
+
+replace_marked_block <- function(lines, start_marker, end_marker, replacement) {
+  start_index <- match(start_marker, lines)
+  end_index <- match(end_marker, lines)
+  if (is.na(start_index) || is.na(end_index) || end_index <= start_index) {
+    stop("README markers were not found in the expected order.", call. = FALSE)
+  }
+  before <- if (start_index > 1L) lines[seq_len(start_index - 1L)] else character()
+  after <- if (end_index < length(lines)) {
+    lines[seq.int(end_index + 1L, length(lines))]
+  } else {
+    character()
+  }
+  c(before, start_marker, replacement, end_marker, after)
+}
+
+update_readme_model_results <- function(
+    readme_path, majority_accuracy, best_candidate, best_auc,
+    imbalance_strategy, feature_source, final_model_label, tuning_auc) {
+  lines <- readLines(readme_path, warn = FALSE)
+  replacement <- c(
+    sprintf("- Majority-class accuracy: **%.4f**", majority_accuracy),
+    "- Majority-class ROC AUC: **0.5000**",
+    sprintf("- Best candidate model: **%s**", best_candidate),
+    sprintf("- Best three-fold CV ROC AUC: **%.4f**", best_auc),
+    sprintf("- Best gradient-boosting class strategy: **%s**", imbalance_strategy),
+    sprintf("- Supplementary-feature decision: **%s**", feature_source),
+    sprintf("- Final tuned model: **%s**", final_model_label),
+    sprintf("- Best tuning-sample ROC AUC: **%.4f**", tuning_auc)
+  )
+  updated <- replace_marked_block(
+    lines, "<!-- MODEL_RESULTS_START -->", "<!-- MODEL_RESULTS_END -->", replacement
+  )
+  writeLines(updated, readme_path)
+  invisible(readme_path)
+}
+initialize_modeling_session(params$seed)
+ensure_project_directories(
+  project_path(params$outputs_dir),
+  project_path(params$models_dir)
+)
+set.seed(params$seed)
+```
+
+The notebook writes resampling results, the fitted model, and the Kaggle submission only to ignored local folders. The Git repository therefore contains reproducible code but not large data or model artifacts.
+
+## Data review and validation
+
+### Competition tables
+
+The availability check accepts both normal Kaggle filenames and duplicate browser-download names such as `bureau(1).csv`.
+
+```{r}
+#| label: data-inventory
+
+data_inventory <- available_home_credit_files(project_path(params$data_dir))
+inventory_display <- data_inventory[, c(
+  "file", "grain", "primary_key", "join_key", "available"
+)]
+
+knitr::kable(
+  inventory_display,
+  col.names = c("File", "Row grain", "Candidate key", "Join key", "Available"),
+  caption = "Home Credit tables and local availability"
+)
+```
+
+`application_train.csv` and `application_test.csv` are required. Historical files are optional. The notebook uses whichever of `bureau.csv`, `previous_application.csv`, `installments_payments.csv`, `POS_CASH_balance.csv`, and `credit_card_balance.csv` are available.
+
+`bureau_balance.csv` is unusually large, so its processing is disabled by default. Set `include_bureau_balance: true` only if the computer has enough memory. The less expensive `bureau.csv` aggregates are still used when available.
+
+### Current applications
+
+Prepared application files in `data/processed` are preferred when present; otherwise the raw Kaggle files are read. Deterministic features are created identically for train and test. These include age and employment duration in years, credit and annuity ratios, household-adjusted income, external-score summaries, and missingness counts.
+
+```{r}
+#| label: read-applications
+
+application_data <- read_application_data(
+  raw_dir = project_path(params$data_dir),
+  processed_dir = project_path(params$processed_dir)
+)
+
+train_application <- engineer_application_features(application_data$train)
+test_application <- engineer_application_features(application_data$test)
+aligned_application <- harmonize_train_test(train_application, test_application)
+train_application <- aligned_application$train
+test_application <- aligned_application$test
+
+application_summary <- data.frame(
+  data_set = c("Training", "Test"),
+  rows = c(nrow(train_application), nrow(test_application)),
+  columns = c(ncol(train_application), ncol(test_application)),
+  unique_applicants = c(
+    length(unique(train_application$SK_ID_CURR)),
+    length(unique(test_application$SK_ID_CURR))
+  )
+)
+
+knitr::kable(
+  application_summary,
+  caption = "Application data after deterministic feature engineering"
+)
+```
+
+```{r}
+#| label: target-rate
+
+target_counts <- table(train_application$TARGET)
+target_summary <- data.frame(
+  target = as.integer(names(target_counts)),
+  applications = as.integer(target_counts),
+  share = as.numeric(target_counts) / sum(target_counts)
+)
+
+knitr::kable(
+  target_summary,
+  digits = 4,
+  caption = "Training target distribution"
+)
+```
+
+The observed default rate is `r sprintf("%.1f%%", 100 * mean(train_application$TARGET == 1L))`. This imbalance is why ROC AUC, rather than accuracy, is the main comparison measure.
+
+```{r}
+#| label: engineered-features
+
+engineered_names <- c(
+  "AGE_YEARS", "EMPLOYED_YEARS", "REGISTRATION_YEARS",
+  "CREDIT_TO_INCOME", "ANNUITY_TO_INCOME", "GOODS_TO_CREDIT",
+  "PAYMENT_RATE", "INCOME_PER_PERSON", "EMPLOYED_TO_AGE",
+  "EXT_SOURCE_MEAN", "EXT_SOURCE_MISSING", "APPLICATION_MISSING_COUNT"
+)
+
+engineered_display <- data.frame(
+  engineered_predictor = intersect(engineered_names, names(train_application))
+)
+knitr::kable(engineered_display, caption = "Engineered application predictors")
+```
+
+## Supplementary features
+
+Each historical table is summarized to the applicant level before joining. The cache avoids rebuilding several-million-row aggregates on every render. It is written under `data/processed`, which is excluded from Git.
+
+```{r}
+#| label: supplementary-features
+
+supplementary_features <- NULL
+supplementary_joined <- NULL
+
+if (isTRUE(params$include_supplementary)) {
+  cache_name <- if (isTRUE(params$include_bureau_balance)) {
+    "supplementary_features_with_bureau_balance.csv"
+  } else {
+    "supplementary_features.csv"
+  }
+  supplementary_features <- load_or_build_supplementary_features(
+    data_dir = project_path(params$data_dir),
+    cache_path = project_path(file.path(params$processed_dir, cache_name)),
+    include_bureau_balance = isTRUE(params$include_bureau_balance)
+  )
+}
+
+if (!is.null(supplementary_features)) {
+  supplementary_joined <- join_supplementary_features(
+    train_application,
+    test_application,
+    supplementary_features
+  )
+  supplementary_summary <- data.frame(
+    applicant_rows = nrow(supplementary_features),
+    engineered_columns = ncol(supplementary_features) - 1L,
+    train_rows_after_join = nrow(supplementary_joined$train)
+  )
+  knitr::kable(
+    supplementary_summary,
+    caption = "Applicant-level supplementary feature set"
+  )
+} else {
+  cat("No supplementary table was found, so the comparison is skipped.\n")
+}
+```
+
+## Performance benchmark
+
+The majority-class classifier predicts non-default for every applicant. Its accuracy is high because defaults are uncommon, but its ROC AUC is 0.50 because a constant score cannot rank applicants.
+
+```{r}
+#| label: majority-baseline
+
+benchmark <- baseline_metrics(train_application)
+knitr::kable(
+  benchmark,
+  digits = 4,
+  col.names = c("Benchmark", "Metric", "Estimate", "Meaning"),
+  caption = "Majority-class performance benchmark"
+)
+```
+
+## Candidate models and cross-validation
+
+For a manageable exploratory run, I use a stratified sample of 50,000 rows for candidate comparison. Change `candidate_rows` to `0` to use all rows. Every model is evaluated on the same three stratified folds.
+
+The candidates are:
+
+- logistic regression with a focused predictor set;
+- elastic-net logistic regression with all predictors;
+- random forest;
+- gradient boosting without resampling;
+- gradient boosting with downsampling; and
+- gradient boosting with upsampling.
+
+Numeric missing values are filled with training-fold medians. Categorical values are replaced by their training-fold frequency, with unseen validation/test values assigned zero. This creates a compact numeric matrix without thousands of dummy variables.
+
+```{r}
+#| label: candidate-data
+
+candidate_train <- if (
+  params$candidate_rows > 0 && params$candidate_rows < nrow(train_application)
+) {
+  stratified_sample_rows(
+    train_application,
+    n = params$candidate_rows,
+    seed = params$seed
+  )
+} else {
+  train_application
+}
+
+candidate_sampling_note <- data.frame(
+  full_training_rows = nrow(train_application),
+  candidate_rows_used = nrow(candidate_train),
+  cv_folds = params$cv_folds,
+  default_rate = mean(candidate_train$TARGET == 1L)
+)
+knitr::kable(
+  candidate_sampling_note,
+  digits = 4,
+  caption = "Candidate-model computation settings"
+)
+```
+
+```{r}
+#| label: candidate-cv
+#| cache: true
+
+candidate_output <- evaluate_candidates(
+  data = candidate_train,
+  registry = candidate_registry(),
+  v = params$cv_folds,
+  seed = params$seed
+)
+candidate_summary <- candidate_output$summary
+
+data.table::fwrite(
+  candidate_summary,
+  project_path(file.path(params$outputs_dir, "candidate_cv_summary.csv"))
+)
+saveRDS(
+  candidate_output,
+  project_path(file.path(params$outputs_dir, "candidate_cv_results.rds"))
+)
+```
+
+```{r}
+#| label: candidate-results
+
+candidate_display <- candidate_summary[, c(
+  "model_label", "imbalance", "mean_roc_auc", "se_roc_auc",
+  "mean_pr_auc", "mean_accuracy", "mean_sensitivity", "mean_specificity"
+)]
+knitr::kable(
+  candidate_display,
+  digits = 4,
+  col.names = c(
+    "Model", "Class strategy", "ROC AUC", "SE", "PR AUC",
+    "Accuracy", "Sensitivity", "Specificity"
+  ),
+  caption = "Three-fold cross-validation estimates"
+)
+```
+
+```{r}
+#| label: candidate-auc-plot
+#| fig-height: 4.8
+
+plot_order <- order(candidate_summary$mean_roc_auc)
+plot_values <- candidate_summary$mean_roc_auc[plot_order]
+plot_labels <- candidate_summary$model_label[plot_order]
+dotchart(
+  plot_values,
+  labels = plot_labels,
+  xlab = "Mean validation ROC AUC",
+  main = "Candidate-model comparison",
+  pch = 19,
+  xlim = range(c(0.5, plot_values), finite = TRUE)
+)
+abline(v = 0.5, lty = 2, col = "gray50")
+```
+
+The best candidate by mean out-of-sample ROC AUC is **`r candidate_summary$model_label[[1]]`**, with estimated AUC **`r sprintf("%.4f", candidate_summary$mean_roc_auc[[1]])`**.
+
+## Class-imbalance experiment
+
+The next table holds the algorithm and features fixed and compares no resampling, downsampling, and upsampling. Resampling can improve sensitivity, but it does not automatically improve ranking AUC.
+
+```{r}#| label: imbalance-results
+
+imbalance_summary <- candidate_summary[
+  candidate_summary$algorithm == "gbm",
+  c("model_label", "imbalance", "mean_roc_auc", "mean_pr_auc",
+    "mean_accuracy", "mean_sensitivity", "mean_specificity")
+]
+imbalance_summary <- imbalance_summary[
+  order(imbalance_summary$mean_roc_auc, decreasing = TRUE),
+]
+
+knitr::kable(
+  imbalance_summary,
+  digits = 4,
+  col.names = c(
+    "Model", "Strategy", "ROC AUC", "PR AUC", "Accuracy",
+    "Sensitivity", "Specificity"
+  ),
+  caption = "Gradient boosting with and without class adjustment"
+)
+```
+
+The best boosting class strategy is **`r imbalance_summary$imbalance[[1]]`**. This strategy is selected on AUC, not on training class balance or raw accuracy.
+
+## Supplementary-feature comparison
+
+To make a fair application-only versus historical-data comparison, I use the highest-AUC candidate whose predictor set includes all columns. The same folds, algorithm, and class strategy are used for both versions.
+
+```{r}
+#| label: supplementary-comparison
+#| cache: true
+
+best_application_config <- best_candidate_config(candidate_summary)
+selected_config <- best_application_config
+selected_feature_source <- "Application features only"
+selected_candidate_auc <- candidate_summary$mean_roc_auc[[1]]
+supplementary_comparison <- NULL
+
+if (!is.null(supplementary_joined)) {
+  full_candidate_summary <- candidate_summary[
+    candidate_summary$predictor_set == "full",
+  ]
+  full_candidate_summary <- full_candidate_summary[
+    order(full_candidate_summary$mean_roc_auc, decreasing = TRUE),
+  ]
+  comparison_config <- candidate_registry()
+  comparison_config <- comparison_config[
+    comparison_config$model_id == full_candidate_summary$model_id[[1]],
+    , drop = FALSE
+  ]
+
+  candidate_supplementary <- supplementary_joined$train[
+    match(candidate_train$SK_ID_CURR, supplementary_joined$train$SK_ID_CURR),
+    , drop = FALSE
+  ]
+  if (any(is.na(candidate_supplementary$SK_ID_CURR))) {
+    stop("Applicant IDs were lost during the supplementary join.")
+  }
+
+  supplementary_cv <- cross_validate_config(
+    candidate_supplementary,
+    comparison_config,
+    v = params$cv_folds,
+    seed = params$seed
+  )
+  supplementary_auc <- mean(
+    supplementary_cv$fold_metrics$roc_auc,
+    na.rm = TRUE
+  )
+  application_full_auc <- full_candidate_summary$mean_roc_auc[[1]]
+  supplementary_comparison <- data.frame(
+    feature_set = c("Application only", "Application + historical aggregates"),
+    model = comparison_config$model_label[[1]],
+    mean_roc_auc = c(application_full_auc, supplementary_auc)
+  )
+
+  if (supplementary_auc > selected_candidate_auc) {
+    selected_config <- comparison_config
+    selected_feature_source <- "Application plus historical aggregate features"
+    selected_candidate_auc <- supplementary_auc
+  }
+
+  data.table::fwrite(
+    supplementary_comparison,
+    project_path(file.path(params$outputs_dir, "supplementary_comparison.csv"))
+  )
+  saveRDS(
+    supplementary_cv,
+    project_path(file.path(params$outputs_dir, "supplementary_cv_results.rds"))
+  )
+  knitr::kable(
+    supplementary_comparison,
+    digits = 4,
+    col.names = c("Feature set", "Fixed model", "Mean ROC AUC"),
+    caption = "Effect of applicant-level historical aggregates"
+  )
+} else {
+  cat("Supplementary features were unavailable, so application features are retained.\n")
+}
+```
+
+The selected feature source is **`r selected_feature_source`**. It is retained only when its cross-validated AUC exceeds the best application-only candidate.
+
+## Randomized hyperparameter tuning
+
+The best selected model family is tuned with 20 randomly sampled parameter combinations, a stratified 5,000-row sample, and three-fold cross-validation. This follows the assignment's speed guidance and is much less expensive than an exhaustive grid.
+
+If ordinary logistic regression was the leading candidate, tuning uses its elastic-net extension because unpenalized logistic regression has few meaningful hyperparameters.
+
+```{r}
+#| label: final-data-choice
+
+if (identical(
+  selected_feature_source,
+  "Application plus historical aggregate features"
+)) {
+  final_train <- supplementary_joined$train
+  final_test <- supplementary_joined$test
+} else {
+  final_train <- train_application
+  final_test <- test_application
+}
+
+final_aligned <- harmonize_train_test(final_train, final_test)
+final_train <- final_aligned$train
+final_test <- final_aligned$test
+tuning_config <- tuning_target_config(selected_config)
+
+tuning_data <- stratified_sample_rows(
+  final_train,
+  n = params$tuning_rows,
+  seed = params$seed + 1L
+)
+
+tuning_settings <- data.frame(
+  model = tuning_config$model_label[[1]],
+  algorithm = tuning_config$algorithm[[1]],
+  class_strategy = tuning_config$imbalance[[1]],
+  rows = nrow(tuning_data),
+  folds = params$cv_folds,
+  random_combinations = params$tuning_iterations
+)
+knitr::kable(tuning_settings, caption = "Randomized tuning settings")
+```
+
+```{r}
+#| label: randomized-tuning
+#| cache: true
+
+tuning_output <- tune_candidate(
+  data = tuning_data,
+  config = tuning_config,
+  v = params$cv_folds,
+  grid_size = params$tuning_iterations,
+  seed = params$seed + 2L
+)
+
+best_parameters <- tuning_output$best_parameters
+data.table::fwrite(
+  tuning_output$summary,
+  project_path(file.path(params$outputs_dir, "randomized_tuning_results.csv"))
+)
+saveRDS(
+  tuning_output,
+  project_path(file.path(params$outputs_dir, "randomized_tuning_results.rds"))
+)
+```
+
+```{r}
+#| label: tuning-results
+
+knitr::kable(
+  head(tuning_output$summary, 10L),
+  digits = 5,
+  caption = "Top randomized-search configurations by validation ROC AUC"
+)
+
+best_parameter_table <- data.frame(
+  parameter = names(best_parameters),
+  value = as.character(unlist(best_parameters, use.names = FALSE))
+)
+knitr::kable(
+  best_parameter_table,
+  caption = "Selected hyperparameters"
+)
+```
+
+The best tuning-sample ROC AUC is **`r sprintf("%.4f", tuning_output$best_auc)`**. Because this estimate is based on only 5,000 rows, it is used to choose hyperparameters rather than to claim the final model's definitive performance.
+
+## Final model and variable importance
+
+The selected model is now trained on the complete training data using preprocessing learned from that complete training set. The saved object includes both the fitted preprocessor and fitted model, so the identical transformations are applied to the test set.
+
+```{r}
+#| label: final-fit
+#| cache: true
+
+final_model <- fit_final_model(
+  data = final_train,
+  config = tuning_config,
+  best_parameters = best_parameters,
+  seed = params$seed + 3L
+)
+saveRDS(
+  final_model,
+  project_path(file.path(params$models_dir, "final_home_credit_model.rds"))
+)
+
+importance_table <- model_importance(final_model, top_n = 20L)
+knitr::kable(
+  importance_table,
+  digits = 3,
+  col.names = c("Feature", "Importance"),
+  caption = "Top model-specific variable importance values"
+)
+```
+
+```{r}
+#| label: importance-plot
+#| fig-height: 5.5
+
+if (nrow(importance_table) > 0L) {
+  display_importance <- importance_table[nrow(importance_table):1L, ]
+  par(mar = c(5, 10, 3, 1))
+  barplot(
+    display_importance$importance,
+    names.arg = display_importance$feature,
+    horiz = TRUE,
+    las = 1,
+    border = NA,
+    xlab = "Model-specific importance",
+    main = "Most influential predictors"
+  )
+}
+```
+
+These importance values describe associations used by the fitted model. They do not establish that changing a feature would cause default risk to change.
+
+## Kaggle submission
+
+The competition requires one probability named `TARGET` for every test-set `SK_ID_CURR`.
+
+```{r}
+#| label: submission
+
+submission_path <- project_path(
+  file.path(params$outputs_dir, "submission.csv")
+)
+submission <- make_submission(final_model, final_test, submission_path)
+
+submission_check <- data.frame(
+  rows = nrow(submission),
+  unique_ids = length(unique(submission$SK_ID_CURR)),
+  missing_probabilities = sum(is.na(submission$TARGET)),
+  minimum_probability = min(submission$TARGET),
+  maximum_probability = max(submission$TARGET)
+)
+knitr::kable(
+  submission_check,
+  digits = 6,
+  caption = "Kaggle submission validation"
+)
+```
+
+Submit the file from a terminal after installing and authenticating the Kaggle command-line tool:
+
+```{bash}
+#| eval: false
+kaggle competitions submit \
+  -c home-credit-default-risk \
+  -f outputs/submission.csv \
+  -m "Tuned Home Credit model"
+```
+
+### Recorded Kaggle score
+
+After Kaggle reports the public score, record it and render again:
+
+```{bash}
+#| eval: false
+Rscript scripts/record_kaggle_score.R 0.000000 "Tuned Home Credit model"
+quarto render notebooks/modeling.qmd
+```
+
+```{r}
+#| label: kaggle-score
+
+kaggle_score <- read_kaggle_score(
+  project_path(file.path("config", "kaggle_score.yml"))
+)
+if (is.null(kaggle_score$public_auc)) {
+  cat("Kaggle public leaderboard AUC: pending submission.\n")
+} else {
+  cat(sprintf(
+    "Kaggle public leaderboard AUC: %.6f (%s, %s).\n",
+    kaggle_score$public_auc,
+    kaggle_score$submission_name,
+    kaggle_score$submission_date
+  ))
+}
+```
+
+## Project documentation update
+
+The final code chunk writes the executed results between fixed markers in the README. This keeps the documentation synchronized with the notebook while leaving data, fitted models, and submissions out of Git.
+
+```{r}
+#| label: update-readme
+
+update_readme_model_results(
+  readme_path = project_path("README.md"),
+  majority_accuracy = benchmark$estimate[benchmark$metric == "Accuracy"],
+  best_candidate = candidate_summary$model_label[[1]],
+  best_auc = candidate_summary$mean_roc_auc[[1]],
+  imbalance_strategy = imbalance_summary$imbalance[[1]],
+  feature_source = selected_feature_source,
+  final_model_label = tuning_config$model_label[[1]],
+  tuning_auc = tuning_output$best_auc
+)
+```
+
+## Reproducibility and limitations
+
+```{r}
+#| label: session-info
+
+sessionInfo()
+```
+
+Cross-validation and a Kaggle score evaluate discrimination on this historical competition dataset. They do not establish future calibration, fairness across applicant groups, lending-policy impact, or causal effects. Frequency encoding is deliberately memory-efficient, but more elaborate encodings may improve predictive performance.
