@@ -1,185 +1,47 @@
-# Home Credit Default Risk
+Home Credit payment difficulty | Individual analytics portfolio
+Business question: Can application and credit-history data help a lender identify payment difficulty while preserving access for applicants who can repay? I analyzed the Home Credit Default Risk Kaggle data from data audit through model selection and a credit-policy model card. The competition's TARGET measures payment difficulty, not an observed loan loss or a universal definition of default.
 
-This project studies whether application-time information can help rank the risk
-of payment difficulty for Home Credit applicants, including applicants with
-limited conventional credit histories. The analysis supports a documented
-credit-review process; it does not establish causal effects or justify automated
-adverse-action decisions.
+The proposed use is decision support for manual review. The current model is not approved for automated credit decisions.
+File index
+Individual work	What to open
+[EDA notebook](home_credit_eda.qmd)	Application grain, missingness, sentinel values, drift, figures and preparation decisions.
+[Data-preparation script](data_preparation.R)	A reusable training-fitted cleaning and feature-engineering demonstration.
+[Modeling notebook](Home_Credit_Modeling_Assignment/Home_Credit_Modeling_Assignment.qmd)	Cross-validation, class imbalance, model comparison, tuning and Kaggle submission.
+[Model card](model_card.qmd)	Business threshold, sourced cost scenario, SHAP, adverse-action mapping, group outcomes and deployment risks.
 
-The project uses the Kaggle
-[Home Credit Default Risk](https://www.kaggle.com/competitions/home-credit-default-risk)
-application data. Raw data, prepared data, fitted parameters, and model objects
-are intentionally excluded from Git.
 
-## Data-preparation script
+Project at a glance
+Evidence	Result	Interpretation
+Labeled applications	307,511	Historical applicants; 8.07% have TARGET = 1.
+Application-only candidate, three-fold CV ROC AUC	0.7515	Uses application features on a 50,000-applicant comparison sample.
+Application plus history candidate, three-fold CV ROC AUC	0.7670	Better ranking from historical aggregates; pre-tuning candidate.
+Tuned model, public Kaggle ROC AUC	0.761350	Separate competition test set; does not measure calibration or profit.
+Internal threshold assessment	60.5% raw score	Selected on half of a supplied 50,000-row out-of-fold file; see verification caveat below.
 
-[`data_preparation.R`](data_preparation.R) is a reusable base-R fit/transform
-pipeline for `application_train.csv` and `application_test.csv`. It:
 
-- validates the source schema and preserves one row per `SK_ID_CURR`;
-- cleans sentinel values, invalid domains, and undocumented unknown categories;
-- converts negative day offsets into interpretable positive-year features;
-- creates affordability, household, tenure, external-score, inquiry, document,
-  contact, log, interaction, capped, and binned features;
-- creates missing-data indicators before median imputation;
-- learns medians, cap bounds, quantile-bin edges, rare categories, and allowed
-  category levels from training data only;
-- stores the fitted recipe as an RDS file and reuses it unchanged on test; and
-- checks that train and test have identical predictors in identical order, with
-  `TARGET` present only in train.
+The model comparison included logistic regression, elastic net, random forest, and gradient boosting under several class-balancing strategies. The selected model was a tuned, upsampled gradient-boosted machine with application and historical credit aggregates. I fitted preprocessing within training folds so assessment rows did not determine imputation or encodings.
+What changed my modeling choices
+- Data audit: DAYS_EMPLOYED = 365243 occurs in 55,374 training applications and is a sentinel rather than plausible employment tenure. Heavy missingness, train/test differences, and application-time availability also require explicit checks.
+- Feature evidence: External scores show strong descriptive separation across deciles, but their origin and timing need verification. Historical payment behavior improves ranking and needs careful applicant-level joins.
+- Decision tradeoff: In a provisional internal assessment, the 60.5% raw-score cutoff yielded 80.5% modeled approvals, 20.6% precision and 49.6% recall among flagged applicants. These estimates depend on confirming that each out-of-fold prediction came from the final tuned configuration and excluded that applicant during training.
+- Deployment gate: Scores are substantially miscalibrated, so the raw cutoff is not a 60.5% probability of default. The model also uses CODE_GENDER and education fields, and modeled approval rates differ by group. It needs feature review, an untouched validation set, calibration, and a fair-lending assessment before a pilot.
 
-`SK_ID_CURR` remains in each output so predictions can be joined back to an
-application, but it must be excluded from model predictors. Sensitive or proxy
-attributes such as age, gender, and family status are retained for subgroup
-auditing and should not be used as underwriting predictors without legal and
-policy approval.
+Exploratory association in the training data; the chart is not an individual denial reason or evidence of causality.
 
-## How the EDA decisions are implemented
+The data-preparation script is a separate fit/transform exercise. The modeling notebook builds its own application and historical features; this README does not claim the selected GBM was trained on the script's 229-column prepared export.
+Business value and limitations
+A useful ranking could help credit staff prioritize applications for review and investigate the cost of payment problems alongside the cost of declining applicants who would repay. The model card's $56,637 contribution per 1,000 assessed applications is an illustrative scenario based on proxy loan economics and normalized balances. It is not observed profit, cost savings, or improvement over the existing lending policy.
 
-| EDA decision | Implementation in `data_preparation.R` |
-|---|---|
-| Recode `DAYS_EMPLOYED=365243` and retain its missing mechanism | Replaces the sentinel with `NA`, creates `DAYS_EMPLOYED_SENTINEL_FLAG`, and creates positive `EMPLOYMENT_YEARS`. |
-| Treat invalid region ratings as unknown | Maps values outside 1–3 to `NA` and adds an invalid-domain flag. |
-| Treat `XNA` and `Unknown` as placeholders | Maps them to the shared `__UNKNOWN__` category before category pooling. |
-| Make negative day offsets interpretable | Creates positive `AGE_YEARS`, `EMPLOYMENT_YEARS`, `REGISTRATION_YEARS`, `ID_PUBLISH_YEARS`, and `PHONE_CHANGE_YEARS`. |
-| Retain informative missingness | Creates indicators for fields with at least 5% training missingness and named business-relevant fields; indicators are created before imputation. |
-| Learn imputation only from training | Stores numeric training medians and applies exactly those values to test. Categories use explicit `__MISSING__`, `__RARE__`, and `__UNKNOWN__` levels. |
-| Do not automatically delete extreme monetary observations | Keeps original values, adds log features, and creates sensitivity versions capped at the training 0.5th and 99.5th percentiles. |
-| Model nonlinear amount and burden patterns | Learns training-decile edges for age, tenure, log income, credit, credit/income, and annuity/income; frozen edges are reused for test. |
-| Retain provisional affordability proxies | Creates annuity/income, credit/income, annuity/credit, credit/goods, income/person, children/family, and employment/age ratios with safe denominators. |
-| Test product interactions | Retains contract type and creates `CASH_X_CREDIT_INCOME`. |
-| Retain income and employment stability candidates | Creates log income, clean tenure, capped household counts, and training-pooled rare occupation/employer categories. |
-| Prioritize external scores with missingness and governance controls | Retains all three scores and their missing flags; creates count, mean, minimum, maximum, standard deviation, and an affordability interaction. |
-| Prefer yearly inquiry information while recognizing shared missingness | Retains source fields, adds total inquiries and `BUREAU_INQUIRY_MISSING_FLAG`; later selection can remove redundant short windows. |
-| Summarize application completeness/contactability | Creates `DOCUMENT_COUNT` and `CONTACT_COUNT`. |
-| Preserve application grain and exclude the identifier from modeling | Asserts unique, non-null `SK_ID_CURR`; retains it only as a join key. |
+The source data are historical, earlier model tuning overlapped the out-of-fold assessment population, and there is no independent untouched holdout. External-score definitions and application-time availability remain unverified. I would validate on later applications, calibrate the model, revisit sensitive predictors and explanations, and compare any supervised pilot with the existing policy before claiming business benefit.
+Reproduce
+Download the competition data from Kaggle to data/raw/ for the root-level EDA notebook. The modeling notebook is inside Home_Credit_Modeling_Assignment/, and its current relative data_dir, outputs_dir, and models_dir settings need to be aligned with the repository paths before rendering. The repository excludes raw data, prepared exports, model objects, prediction files and HTML submissions. Use R and Quarto from the repository root after aligning those paths:
+quarto render home_credit_eda.qmd --to html
+quarto render Home_Credit_Modeling_Assignment/Home_Credit_Modeling_Assignment.qmd --to html
+The EDA notebook uses notebook.css and the checked-in figures/ assets. Modeling additionally uses R packages data.table, glmnet, randomForest, gbm and knitr. The model card requires the saved final model and locally generated outputs/model_card_oof.csv and outputs/model_card_features.csv; the modeling notebook does not automatically export those two files. See the model card's reproduction section before rendering it.
 
-### EDA decisions not implemented in preparation
-
-- **Supplementary tables:** not processed because the EDA explicitly used only
-  `application_train` and `application_test` and concluded that supplementary
-  tables were optional and unnecessary for its conclusions.
-- **Class imbalance:** stratified resampling, class-aware metrics, calibration,
-  and decision thresholds belong in model training/evaluation, not in a
-  deterministic preparation script. `TARGET` is not resampled here.
-- **Production point-in-time approval:** the EDA could not verify source timing
-  for 110 fields. This script cannot replace a field-level lineage review.
-- **External-score governance and sensitive-feature authorization:** the script
-  preserves the fields for research and auditing, but approval is a policy and
-  legal decision rather than a data transformation.
-- **Distribution-drift action:** the script freezes training parameters and
-  handles unknown categories, but it does not alter test distributions. Contract
-  type, `EXT_SOURCE_1`, and credit should be monitored during validation.
-
-## Train/test consistency
-
-`fit_preprocessor()` receives only the training table and stores:
-
-- numeric medians;
-- 0.5th/99.5th percentile cap bounds;
-- decile bin edges;
-- rare category lists and the allowed training category vocabulary;
-- the source schema and exact prepared predictor order.
-
-`transform_application()` reuses this frozen recipe for either partition. It
-never recomputes a statistic from test data. Test-only categorical values map to
-`__UNKNOWN__`; missing values map to the stored training median or the explicit
-`__MISSING__` category.
-
-The complete supplied files contain 307,511 training applications and 48,744
-test applications. The preparation recipe produces 229 aligned predictor
-columns, including `SK_ID_CURR`; train additionally contains `TARGET`.
-`validate_prepared_data()` checks and reports:
-
-| Check | Required result |
-|---|---:|
-| Prepared train dimensions | 307,511 rows × 230 columns, including `TARGET` |
-| Prepared test dimensions | 48,744 rows × 229 predictor columns |
-| Identical predictor names and order | `TRUE` |
-| `TARGET` only in train | `TRUE` |
-| Train: one row per non-null `SK_ID_CURR` | `TRUE` |
-| Test: one row per non-null `SK_ID_CURR` | `TRUE` |
-| Train/test ID overlap | 0 |
-| Remaining numeric missing values | 0 in train; 0 in test |
-| Remaining categorical missing values | 0 in train; 0 in test |
-| Remaining `DAYS_EMPLOYED=365243` values | 0 in train; 0 in test |
-
-The 229 prepared predictor columns include the identifier, leaving 228 candidate
-model fields after excluding `SK_ID_CURR`. Final modeling may further exclude
-audit-only, redundant, or governance-restricted fields.
-
-## Inputs, outputs, and how to run
-
-The script requires R 4.1 or newer and uses only base R. From the repository
-root, place the Kaggle files under `data/raw/`:
-
-```text
-data/raw/application_train.csv   # 307,511 rows × 122 columns
-data/raw/application_test.csv    # 48,744 rows × 121 columns
-```
-
-Run the complete pipeline:
-
-```bash
-Rscript data_preparation.R \
-  --train data/raw/application_train.csv \
-  --test data/raw/application_test.csv \
-  --output-dir data/processed
-```
-
-The command creates:
-
-| Output | Contents | Dimensions |
-|---|---|---:|
-| `data/processed/application_train_prepared.csv` | Prepared predictors plus `TARGET` | 307,511 × 230 |
-| `data/processed/application_test_prepared.csv` | Prepared test predictors | 48,744 × 229 |
-| `data/processed/preparation_parameters.rds` | Training medians, caps, bins, category rules, and schema | One fitted recipe |
-| `data/processed/preparation_validation.csv` | Machine-readable integrity and consistency checks | One row per check |
-
-To run every transformation and validation check without writing the two large
-prepared CSV files, add `--validate-only`:
-
-```bash
-Rscript data_preparation.R \
-  --train data/raw/application_train.csv \
-  --test data/raw/application_test.csv \
-  --output-dir data/processed \
-  --validate-only
-```
-
-The functions can also be sourced and called from R or Quarto:
-
-```r
-source("data_preparation.R")
-
-train <- read.csv(
-  "data/raw/application_train.csv",
-  check.names = FALSE,
-  stringsAsFactors = FALSE,
-  na.strings = c("", "NA")
-)
-test <- read.csv(
-  "data/raw/application_test.csv",
-  check.names = FALSE,
-  stringsAsFactors = FALSE,
-  na.strings = c("", "NA")
-)
-
-recipe <- fit_preprocessor(train)  # fit on training data only
-train_ready <- transform_application(train, recipe, is_train = TRUE)
-test_ready <- transform_application(test, recipe, is_train = FALSE)
-checks <- validate_prepared_data(train_ready, test_ready)
-```
-
-To reuse the fitted recipe in another R session:
-
-```r
-save_preprocessor(recipe, "data/processed/preparation_parameters.rds")
-recipe <- load_preprocessor("data/processed/preparation_parameters.rds")
-```
-
-## Version-control policy
-
-The repository tracks source code, documentation, and notebooks. `.gitignore`
-excludes raw data, prepared CSVs, fitted parameter artifacts, model objects, and
-large serialized intermediates. Do not force-add generated files.
+Interview talking points: leakage-controlled folds, the difference between ranking and calibrated probability, what historical joins contributed, and why fair-lending and financial checks matter before using a risk score.
+<!-- MODEL_RESULTS_START -->
+- Majority-class ROC AUC: 0.5000; accuracy: 0.9193.
+- Pre-tuning candidate three-fold CV ROC AUC: 0.7670 on 50,000 applicants.
+- Tuning-sample CV ROC AUC: 0.7497 on 5,000 applicants.
+<!-- MODEL_RESULTS_END -->
