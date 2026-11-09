@@ -1,0 +1,481 @@
+---
+title: "Home Credit Default Risk | Model card"
+subtitle: "Individual project · decision support for consumer lending"
+author: "Jenny Ngo"
+date: "2026-10-25"
+format:
+  html:
+    toc: true
+    toc-depth: 2
+    code-fold: true
+    code-tools: false
+    embed-resources: true
+    theme: cosmo
+    css: model_card.css
+execute:
+  echo: false
+  warning: false
+  message: false
+params:
+  validation_file: "outputs/model_card_validation.csv"
+  oof_file: "outputs/model_card_oof.csv"
+  features_file: "outputs/model_card_features.csv"
+  model_file: "models/final_home_credit_model.rds"
+  model_name: "Gradient boosting (gbm) with upsampling and historical aggregates"
+  model_version: "Model card 0.3; modeling notebook rendered 2026-10-12"
+  cv_candidate_auc: 0.7670
+  cv_application_auc: 0.7515
+  tuning_auc: 0.7497
+  cv_auc: null # Final tuned model has no documented full-sample CV AUC.
+  kaggle_auc: 0.761350
+  kaggle_score_type: "public leaderboard"
+  cv_folds: 3
+  shap_rows: 1000
+  shap_background_rows: 200
+  shap_nsim: 10
+  shap_group_top_n: 12 # Base-R fallback: explain these leading features; pool other predictors.
+  seed: 6601
+---
+
+```{r setup}
+options(stringsAsFactors = FALSE, scipen = 4)
+set.seed(params$seed)
+show <- function(x, digits = 3) if (length(x) == 0 || is.null(x) || is.na(x[1])) "Pending" else format(round(x[1], digits), nsmall = digits, trim = TRUE)
+pct <- function(x) if (length(x) == 0 || is.null(x) || is.na(x[1])) "Pending" else sprintf("%.1f%%", 100 * x[1])
+money <- function(x) if (is.na(x)) "Pending" else sprintf("$%.0f", x)
+note <- function(x) cat(paste0("<div class='notice'>", x, "</div>\n"))
+tab <- function(x, caption = NULL) print(knitr::kable(x, caption = caption, escape = TRUE, digits = 3))
+read_optional <- function(p) if (file.exists(p)) read.csv(p, check.names = FALSE) else NULL
+roc_auc <- function(y, p) {
+  ok <- !is.na(y) & is.finite(p); y <- y[ok]; p <- p[ok]
+  if (!length(y) || length(unique(y)) != 2) return(NA_real_)
+  ranks <- rank(p, ties.method = "average"); n1 <- sum(y == 1); n0 <- sum(y == 0)
+  (sum(ranks[y == 1]) - n1 * (n1 + 1) / 2) / (n1 * n0)
+}
+valid_data <- function(x, label) {
+  if (is.null(x)) return(NULL)
+  needed <- c("SK_ID_CURR", "TARGET", "p_default", "CODE_GENDER", "NAME_EDUCATION_TYPE")
+  if (!all(needed %in% names(x))) stop(label, " is missing: ", paste(setdiff(needed, names(x)), collapse = ", "))
+  x$TARGET <- suppressWarnings(as.integer(as.character(x$TARGET)))
+  x$p_default <- suppressWarnings(as.numeric(x$p_default))
+  if (!nrow(x)) stop(label, ": input cannot be empty")
+  if (anyNA(x$SK_ID_CURR) || anyDuplicated(x$SK_ID_CURR)) stop(label, ": applicant IDs must be nonmissing and unique")
+  if (anyNA(x$TARGET) || !all(x$TARGET %in% 0:1)) stop(label, ": TARGET must be 0/1 and nonmissing")
+  if (anyNA(x$p_default) || any(x$p_default < 0 | x$p_default > 1)) stop(label, ": p_default must be nonmissing probability in [0,1]")
+  x
+}
+holdout <- valid_data(read_optional(params$validation_file), "Holdout")
+oof <- valid_data(read_optional(params$oof_file), "OOF")
+if (!is.null(holdout) && !is.null(oof) && length(intersect(holdout$SK_ID_CURR, oof$SK_ID_CURR)))
+  stop("OOF and holdout contain overlapping applicant IDs: no honest out-of-sample evaluation")
+# If no independent holdout is available, reserve half the OOF rows for
+# evaluating a threshold chosen only on the other half. All scores must be
+# generated out of fold using the final tuned configuration. This is internal
+# assessment, not a fresh independent holdout: past tuning saw this dataset.
+selection_oof <- oof
+assessment <- holdout
+assessment_kind <- if (is.null(holdout)) "No evaluation sample" else "Independent holdout (verify provenance)"
+if (is.null(holdout) && !is.null(oof)) {
+  by_outcome <- split(seq_len(nrow(oof)), oof$TARGET)
+  if (length(by_outcome) != 2L || any(lengths(by_outcome) < 2L))
+    stop("The OOF sample needs at least two applicants from each target class")
+  set.seed(params$seed + 321L)
+  select_rows <- sort(unlist(lapply(by_outcome, function(i) sample(i, floor(length(i) / 2L))), use.names = FALSE))
+  selection_oof <- oof[select_rows, , drop = FALSE]
+  assessment <- oof[-select_rows, , drop = FALSE]
+  assessment_kind <- "Internal OOF assessment (retrospective tuning; not an independent holdout)"
+}
+
+# Home Credit B.V. 2017: operating income EUR 3,123m; expenses EUR 1,626m;
+# expenses / average net loans 12.9%. Inferred annual contribution before impairment.
+contribution_fraction <- ((3123 / (1626 / .129)) - .129)
+recovery_fraction <- .16 # CFPB 2023: nearly five years of credit-card post-charge-off collections.
+loss_fraction <- 1 - recovery_fraction
+loan_unit <- 1000 # Currency-normalized example, not a claim about actual mean loan size.
+gain <- loan_unit * contribution_fraction
+loss <- loan_unit * loss_fraction
+economic_cutoff <- gain / (gain + loss)
+candidate_grid <- sort(unique(c(seq(0, 1, by = 0.005), economic_cutoff)))
+policy <- function(d, threshold) {
+  approved <- d$p_default < threshold
+  data.frame(threshold = threshold, applicants = nrow(d), approvals = sum(approved),
+    approval_rate = mean(approved), missed_difficulty = sum(approved & d$TARGET == 1),
+    declined_without_difficulty = sum(!approved & d$TARGET == 0),
+    precision_flag = if (sum(!approved)) sum(!approved & d$TARGET == 1) / sum(!approved) else NA_real_,
+    recall_flag = if (sum(d$TARGET == 1)) sum(!approved & d$TARGET == 1) / sum(d$TARGET == 1) else NA_real_,
+    scenario_margin = sum(approved & d$TARGET == 0) * gain - sum(approved & d$TARGET == 1) * loss)
+}
+# Select only on threshold-selection OOF rows; never search on assessment rows.
+threshold <- economic_cutoff
+selection <- "Cost-based break-even rule (provisional; no OOF file)"
+if (!is.null(selection_oof)) {
+  oof_grid <- do.call(rbind, lapply(candidate_grid, function(t) policy(selection_oof, t)))
+  threshold <- oof_grid$threshold[which.max(oof_grid$scenario_margin)]
+  selection <- paste("Maximum scenario margin on", nrow(selection_oof), "OOF threshold-selection rows; separate assessment rows not searched")
+}
+```
+
+::: {.exec-summary}
+## Executive summary
+
+**Recommendation: further validation before any lending-policy pilot.** The modeling notebook selects upsampled gradient boosting with application and historical aggregate features. Its *pre-tuning candidate* achieved 0.7670 mean AUC in three-fold cross validation on 50,000 applicants; the earlier modeling HTML records a 0.761350 Kaggle public AUC for the submitted final tuned model. The model-card render below evaluates a supplied 50,000-row OOF file internally when present. This does not replace a prospective or untouched independent holdout.
+
+The illustrative economics yield **approximately 11.9% annual pre-impairment contribution** on an average loan balance and **84% loss after recovery** on defaulted principal. For a $1,000 unit balance these correspond to about **$119 gain if fully repaid and $840 loss if defaulted**. These are proxies from different markets and products, and the Kaggle `TARGET` is payment difficulty, not a measured ultimate principal loss. Under strong calibration and portability assumptions the break-even risk is **12.4%**; an OOF threshold selected by scenario margin may differ sharply if scores are uncalibrated. [Home Credit 2017 financial results](https://www.homecredit.net/wp-content/uploads/2022/11/home-credit-bv-conso-results-for-year-ended-31-dec-2017.pdf); [CFPB 2023 credit card report, §6.8](https://files.consumerfinance.gov/f/documents/cfpb_consumer-credit-card-market-report_2023.pdf).
+
+**Expected financial impact:** the scenario contribution reported below when applicant-level evaluation scores are available is *not* measured profit uplift against the existing approval policy. Upsampling can change probability calibration. Check calibration, group approval gaps, valid denial reasons and actual loan economics before a pilot.
+
+```{r executive-results, results='asis'}
+if (!is.null(assessment)) {
+  summary_policy <- policy(assessment, threshold)
+  note(paste0("Exploratory ", assessment_kind, ": candidate score cutoff ", pct(threshold),
+    "; approval rate ", pct(summary_policy$approval_rate),
+    "; flagged-case precision ", pct(summary_policy$precision_flag),
+    "; flagged-case recall ", pct(summary_policy$recall_flag),
+    "; scenario contribution ", money(1000 * summary_policy$scenario_margin / summary_policy$applicants),
+    " per 1,000 applications under proxy economics. This is not observed incremental profit."))
+} else note("Applicant-level threshold performance and financial scenario are pending labeled out-of-fold or independent evaluation predictions.")
+```
+:::
+
+## Model details and evidence
+
+The Kaggle task is binary classification: `TARGET = 1` indicates payment difficulty according to the competition definition. Each application has an `SK_ID_CURR` identifier. The executed modeling HTML reports 307,511 training applications (24,825 with `TARGET=1`, or 8.07%), 48,744 Kaggle test applications, and 135 engineered application columns in training. The final model also uses 67 applicant-level aggregate columns drawn from available bureau, previous application, installment, credit card, and POS/cash history. The data are historic and cannot establish prospective performance. [Kaggle dataset description](https://www.kaggle.com/competitions/home-credit-default-risk/data).
+
+```{r model-status, results='asis'}
+tab(data.frame(Item = c("Selected model", "Document version", "Training population", "Candidate CV population", "Tuning population", "Evaluation applicants", "OOF applicants (total)", "OOF threshold-selection applicants", "Evaluation design", "Saved fitted model", "Cross-validation", "Final parameters", "Preprocessing"),
+  Evidence = c(params$model_name, params$model_version, "307,511 labeled applications; final model refit on all labeled rows",
+    "50,000 stratified applicants", "5,000 stratified applicants; 20 random combinations",
+    if (is.null(assessment)) "Pending" else nrow(assessment), if (is.null(oof)) "Pending" else nrow(oof),
+    if (is.null(selection_oof)) "Pending" else nrow(selection_oof), assessment_kind,
+    if (file.exists(params$model_file)) "Present" else "Mentioned in modeling HTML; RDS not supplied here",
+    paste0(params$cv_folds, " stratified folds for candidate comparison and tuning"),
+    "575 trees; depth 2; learning rate 0.016818; minimum node 27; bag fraction 0.635011",
+    "Training-fold median imputation for numeric fields; category frequency encoding; standardization")))
+if (is.null(holdout) && !is.null(oof)) note("No independent holdout was supplied. Assessment uses a reserved half of the OOF predictions. The fitted models excluded each scored applicant, but earlier model selection and tuning used overlapping labeled data.")
+if (is.null(assessment)) note("Neither OOF nor independent labeled evaluation data are available; threshold performance cannot be calculated.")
+```
+
+The executed notebook compared logistic regression, elastic net, random forest and gradient boosting with three class-balance strategies. The best application-only candidate reached AUC 0.7515; adding historical aggregates increased the *same configuration's* candidate CV AUC to 0.7670. Tuning then selected the parameters above using a separate 5,000-row sample. The final model was refit on **all labeled training rows** and saved as `models/final_home_credit_model.rds`, whose presence is checked in the table. A genuinely independent holdout cannot be recovered retrospectively from those same labeled rows; the model artifact itself should also be checked for version and hash before deployment.
+
+## Intended use
+
+The risk and credit policy teams could use predicted payment difficulty to prioritize **manual review and pilot monitoring** of applications like the historical population. A score is a probability estimate conditioned on the observed data, not a finding that a borrower will default. Credit staff must retain access to supporting evidence and a documented appeal path. This model is not designed for autonomous denials, use on a different product or country without validation, pricing, existing-customer collections, or decisions based on missing legal/compliance review.
+
+## Performance and calibration
+
+Here, **precision** means the share of *flagged* applicants who actually had `TARGET=1`; **recall** means the share of applicants with `TARGET=1` that were flagged. A flagged applicant has `p_default ≥ threshold` and is provisionally declined under the scenario. Kaggle scores use a separate unlabeled test set, so Kaggle precision, recall and fairness cannot be calculated from a leaderboard score.
+
+```{r metrics, results='asis'}
+cv <- if (is.null(params$cv_auc)) NA_real_ else as.numeric(params$cv_auc)
+kg <- if (is.null(params$kaggle_auc)) NA_real_ else as.numeric(params$kaggle_auc)
+if ((!is.na(cv) && (cv < 0 || cv > 1)) || (!is.na(kg) && (kg < 0 || kg > 1))) stop("AUC parameters must be in [0,1]")
+h <- if (is.null(assessment)) NULL else policy(assessment, threshold)
+oof_auc <- if (is.null(oof)) cv else roc_auc(oof$TARGET, oof$p_default)
+tab(data.frame(Measure = c("Application-only candidate CV AUC (50,000 rows)", "Application + history candidate CV AUC (50,000 rows)", "Tuning CV AUC (5,000 rows; selection estimate)", "Final tuned configuration pooled OOF AUC (verify prediction provenance)", paste("Final model Kaggle AUC (", params$kaggle_score_type, ")"), paste(assessment_kind, "AUC"), "Flagged-case precision at threshold", "Flagged-case recall at threshold", "Evaluation Brier score"),
+ Result = c(show(params$cv_application_auc, 4), show(params$cv_candidate_auc, 4), show(params$tuning_auc, 4), show(oof_auc, 4), show(kg, 6), if (is.null(h)) "Pending" else show(roc_auc(assessment$TARGET, assessment$p_default)),
+  if (is.null(h)) "Pending" else pct(h$precision_flag), if (is.null(h)) "Pending" else pct(h$recall_flag),
+  if (is.null(h)) "Pending" else show(mean((assessment$p_default - assessment$TARGET)^2)))))
+if (!is.null(assessment)) {
+  bins <- cut(assessment$p_default, breaks = seq(0, 1, by = .1), include.lowest = TRUE)
+  cs <- aggregate(cbind(predicted = assessment$p_default, observed = assessment$TARGET), by = list(Risk_band = bins), FUN = mean)
+  cs$N <- as.numeric(table(bins)[as.character(cs$Risk_band)])
+  cs <- cs[!is.na(cs$predicted), ]
+  tab(cs, paste("Calibration by predicted-risk band on", assessment_kind, "; small bands are unstable"))
+  high_band <- which(as.character(cs$Risk_band) == "(0.6,0.7]")
+  if (length(high_band) && cs$N[high_band] >= 30L)
+    note(paste("Calibration check: among", cs$N[high_band],
+      "applicants in the 0.6–0.7 score band, the average model score was",
+      pct(cs$predicted[high_band]), "while the observed difficulty rate was",
+      pct(cs$observed[high_band]),
+      ". The model scores should not be read as calibrated default probabilities."))
+  plot(cs$predicted, cs$observed, xlim = c(0, max(c(.2, cs$predicted, cs$observed))), ylim = c(0, max(c(.2, cs$predicted, cs$observed))),
+    pch = 19, cex = pmax(.7, sqrt(cs$N) / 10), xlab = "Mean predicted probability", ylab = "Observed payment-difficulty rate",
+    main = "Evaluation calibration; point size reflects band count")
+  abline(0, 1, lty = 2, col = "gray40")
+}
+```
+
+The modeling HTML reports a majority-class baseline AUC of 0.5000 and accuracy of 0.9193, reflecting 8.07% event prevalence. Its 0.7670 CV value belongs to the **pre-tuning candidate**, whereas 0.7497 selects hyperparameters on a small sample. A later OOF file may supply an additional pooled AUC for the fixed tuned configuration on sampled applicants; its provenance must be verified because selection and tuning used overlapping data. The recorded Kaggle score is a public leaderboard AUC and cannot verify calibration. Because upsampling changes class prevalence during fitting, compare predicted probabilities with observed rates before a cash-based cutoff is used.
+
+## Decision threshold and business scenario
+
+Home Credit reported **EUR 3,123 million operating income**, **EUR 1,626 million operating expenses** and expenses of **12.9% of average net loans** in 2017. Dividing expenses by 12.9% implies average net loans of about EUR 12.6 billion; `(3,123 − 1,626) / average net loans ≈ 11.9%` is an **annual portfolio contribution before credit impairment**, used here as a rough return on a repaid balance. Home Credit separately reported an **8.9% cost of risk ratio**; that portfolio ratio is not a borrower-level loss given default. [Home Credit 2017 results, pp. 4–5](https://www.homecredit.net/wp-content/uploads/2022/11/home-credit-bv-conso-results-for-year-ended-31-dec-2017.pdf).
+
+The CFPB found that credit card issuers had recovered **approximately 16% of charged-off balances after nearly five years** for the vintages studied. Applying that as a proxy to an unsecured consumer loan implies **84% loss given default**. Credit cards, markets, currencies, collection periods, gross balances, and the Kaggle label differ: these are *sourced scenario inputs*, not Home Credit's actual per-loan profit or recovery. Do not add the 8.9% portfolio cost of risk again, since it would double count losses in this simple outcome model. [CFPB 2023 report, §6.8](https://files.consumerfinance.gov/f/documents/cfpb_consumer-credit-card-market-report_2023.pdf).
+
+For a fully repaid unit loan, gain `G ≈ $119`; for a defaulted unit loan, loss `L = $840`. Under a calibrated probability `p`, illustrative expected contribution from approval is `(1 − p)G − pL`, so **approve when `p < G / (G + L) ≈ 0.124`**. The arbitrary $1,000 unit cancels in the threshold; it does not claim to represent an average Home Credit loan. The operational threshold may be different after verified interest, financing, servicing, prepayment, recoveries and calibration. Declining a loan earns zero in this simple scenario; it omits customer lifetime value and the current policy's decisions.
+
+```{r threshold, results='asis'}
+tab(data.frame(Item = c("Contribution if fully repaid / $1,000", "Recovery proxy", "Loss given default proxy", "Loss if defaulted / $1,000", "Economic break-even cutoff", "Selected candidate threshold", "Selection method"),
+ Value = c(money(gain), pct(recovery_fraction), pct(loss_fraction), money(loss), pct(economic_cutoff), pct(threshold), selection)))
+if (!is.null(selection_oof) && abs(threshold - economic_cutoff) > .10)
+  note(paste("The sample-selected score cutoff", pct(threshold),
+    "differs sharply from the", pct(economic_cutoff),
+    "cost-based break-even probability. This is consistent with uncalibrated or shifted probabilities after upsampling; do not treat the score cutoff as a calibrated default probability or an operational approval rule."))
+if (!is.null(assessment)) {
+  # Grid is descriptive on rows reserved from threshold selection.
+  grid <- sort(unique(c(.04, .08, economic_cutoff, .16, .20, .25, threshold)))
+  scen <- do.call(rbind, lapply(grid, function(t) policy(assessment, t)))
+  scen$scenario_margin_per_1000 <- 1000 * scen$scenario_margin / scen$applicants
+  tab(data.frame(Threshold = sprintf("%.1f%%", 100 * scen$threshold),
+    Approval_rate = sprintf("%.1f%%", 100 * scen$approval_rate),
+    Approvals = scen$approvals,
+    Difficulties_among_approvals = scen$missed_difficulty,
+    Declined_without_difficulty = scen$declined_without_difficulty,
+    Scenario_margin_per_1000 = sprintf("$%.0f", scen$scenario_margin_per_1000)),
+    paste("Descriptive scenario on", assessment_kind, ": normalized $1,000 balances, not incremental profit"))
+  plot(scen$threshold, scen$scenario_margin_per_1000, type = "b", pch = 19, xlab = "Decline if predicted difficulty is at or above", ylab = "Scenario contribution per 1,000 applications ($)", main = "Illustrative sensitivity to decision threshold")
+  abline(v = threshold, col = "#235789", lty = 2)
+} else note("Applicant-level sensitivity and financial scenario require labeled OOF or holdout predictions.")
+assumptions <- expand.grid(Recovery_proxy = c(.10, .16, .25),
+  Contribution_if_repaid = c(.08, contribution_fraction, .16))
+assumptions$Break_even_cutoff <- assumptions$Contribution_if_repaid /
+  (assumptions$Contribution_if_repaid + 1 - assumptions$Recovery_proxy)
+tab(data.frame(Recovery_proxy = sprintf("%.0f%%", 100 * assumptions$Recovery_proxy),
+  Contribution_if_repaid = sprintf("%.1f%%", 100 * assumptions$Contribution_if_repaid),
+  Break_even_risk = sprintf("%.1f%%", 100 * assumptions$Break_even_cutoff)),
+  "Assumption sensitivity only: how the break-even rule changes; no applicant outcomes are estimated")
+```
+
+::: {.small}
+**Interpretation:** a positive scenario margin describes only the selected approvals under assumed economics. Without the incumbent policy's decisions and outcomes, it cannot be described as profit uplift or savings attributable to the model. Threshold selection uses one portion of the OOF predictions and the evaluation table uses the remaining rows; this avoids optimizing the threshold on the displayed evaluation rows but does not remove earlier model-selection and tuning overlap. An untouched independent holdout is still missing.
+:::
+
+## Explainability: contribution to predicted risk
+
+The modeling notebook already reports **model-specific variable importance**, not SHAP. Its leading fields are `EXT_SOURCE_MEAN`, `GOODS_TO_CREDIT`, `INST_LATE_SHARE`, `PAYMENT_RATE`, and `BUREAU_DEBT_RATIO_MEAN`; `CODE_GENDER` and `NAME_EDUCATION_TYPE` also occur among the top 11 and require a serious feature review. Importance does not show which direction any field pushes an individual decision.
+
+| Feature in the executed modeling HTML | Model-specific importance (not SHAP) |
+|:--|--:|
+| `EXT_SOURCE_MEAN` | 63.296 |
+| `GOODS_TO_CREDIT` | 3.027 |
+| `INST_LATE_SHARE` | 3.019 |
+| `PAYMENT_RATE` | 2.776 |
+| `BUREAU_DEBT_RATIO_MEAN` | 2.766 |
+| `EXT_SOURCE_3` | 2.405 |
+| `PREV_CREDIT_TO_APPLICATION_MEAN` | 2.247 |
+| `CODE_GENDER` | 1.860 |
+| `CC_UTILIZATION_MEAN` | 1.637 |
+| `NAME_EDUCATION_TYPE` | 1.538 |
+
+SHAP distributes a prediction among features relative to a background sample; it does not establish causation. **SHAP is not necessarily measured in percentage points**: raw tree models may report log odds. Given the saved GBM bundle and a 1,200-row raw feature export, the notebook explains up to 1,000 sampled rows with a probability-output wrapper. If `fastshap` is available, it approximates individual-feature SHAP. Otherwise it uses **base R permutation Shapley sampling** for 12 leading features and combines every other predictor into one labeled `OTHER_FEATURES` group. The fallback returns approximate *group* contributions, not individual SHAP values for the pooled features; the method and number of draws appear beside its table. A sample drawn from `final_train` is **in sample** because the fitted model used all labeled applicants. [SHAP permutation documentation](https://shap.readthedocs.io/en/latest/example_notebooks/api_examples/explainers/Permutation.html).
+
+```{r shap, results='asis'}
+shap_status <- "Pending: provide the saved fitted GBM and its raw feature sample. fastshap is optional."
+shap_summary <- NULL
+shap_values <- NULL
+predict_risk <- function(object, newdata) {
+  if (is.list(object) && all(c("preprocessor", "model") %in% names(object)) &&
+      identical(object$model$algorithm, "gbm")) {
+    if (!requireNamespace("gbm", quietly = TRUE)) stop("Install the gbm package to predict from the saved final model")
+    prep <- object$preprocessor
+    missing <- setdiff(prep$predictors, names(newdata))
+    if (length(missing)) stop("Raw feature export is missing trained predictors: ", paste(missing, collapse = ", "))
+    x <- matrix(0, nrow = nrow(newdata), ncol = length(prep$predictors))
+    colnames(x) <- make.names(prep$predictors, unique = TRUE)
+    for (j in seq_along(prep$predictors)) {
+      spec <- prep$encoded[[j]]
+      if (spec$kind == "numeric") {
+        v <- suppressWarnings(as.numeric(newdata[[prep$predictors[[j]]]]))
+        v[!is.finite(v)] <- NA_real_
+        v[is.na(v)] <- spec$median
+      } else {
+        v <- as.character(newdata[[prep$predictors[[j]]]])
+        v[is.na(v) | v == ""] <- "__MISSING__"
+        v <- as.numeric(spec$frequencies[v])
+        v[is.na(v)] <- 0
+      }
+      x[, j] <- v
+    }
+    x <- x[, prep$keep, drop = FALSE]
+    x <- sweep(x, 2L, prep$center, "-")
+    x <- sweep(x, 2L, prep$scale, "/")
+    x[!is.finite(x)] <- 0
+    return(pmin(pmax(as.numeric(stats::predict(object$model$fit, newdata = x,
+      n.trees = object$model$parameters$n.trees, type = "response")), 1e-7), 1 - 1e-7))
+  }
+  if (inherits(object, "xgb.Booster")) return(as.numeric(predict(object, as.matrix(newdata))))
+  ans <- tryCatch(predict(object, new_data = newdata, type = "prob"), error = function(e) NULL)
+  if (is.null(ans)) ans <- tryCatch(predict(object, newdata = newdata, type = "prob"), error = function(e) NULL)
+  if (is.null(ans)) ans <- tryCatch(predict(object, newdata = newdata, type = "response"), error = function(e) NULL)
+  if (is.null(ans)) stop("Saved model predict method unsupported; adjust predict_risk to match the original modeling notebook")
+  if (is.data.frame(ans) || is.matrix(ans)) {
+    nm <- colnames(ans)
+    col <- intersect(c(".pred_1", "1", "TRUE", "yes", "positive", "TARGET"), nm)
+    if (!length(col)) stop("Probability for TARGET=1 not identified in prediction output; check class encoding")
+    return(as.numeric(ans[, col[1]]))
+  }
+  as.numeric(ans)
+}
+base_group_shap <- function(object, X, explained, background, nsim, top_n) {
+  # Monte Carlo permutation Shapley values for selected raw features and one
+  # coalition containing every remaining raw predictor. This is NOT a full
+  # individual-feature SHAP decomposition for the OTHER_FEATURES coalition.
+  leading <- c("EXT_SOURCE_MEAN", "GOODS_TO_CREDIT", "INST_LATE_SHARE",
+    "PAYMENT_RATE", "BUREAU_DEBT_RATIO_MEAN", "EXT_SOURCE_3",
+    "PREV_CREDIT_TO_APPLICATION_MEAN", "CODE_GENDER", "CC_UTILIZATION_MEAN",
+    "INST_PAYMENT_TOTAL", "NAME_EDUCATION_TYPE", "EMPLOYED_YEARS",
+    "PREV_REFUSED_SHARE", "AMT_ANNUITY", "POS_INSTALLMENTS_FUTURE_MEAN")
+  keep <- head(intersect(leading, names(X)), top_n)
+  if (!length(keep)) stop("No importance-ranked features matched the exported raw feature names")
+  groups <- as.list(keep)
+  names(groups) <- keep
+  rest <- setdiff(names(X), keep)
+  if (length(rest)) groups$OTHER_FEATURES <- rest
+  n <- nrow(explained)
+  m <- as.integer(nsim)
+  if (!is.finite(m) || m < 1L) stop("shap_nsim must be a positive integer")
+  values <- matrix(0, nrow = n, ncol = length(groups),
+    dimnames = list(NULL, names(groups)))
+  baseline_mean <- numeric(n)
+  target_probability <- predict_risk(object, explained)
+  for (sim in seq_len(m)) {
+    coalition <- background[sample.int(nrow(background), n, replace = TRUE), , drop = FALSE]
+    before <- predict_risk(object, coalition)
+    baseline_mean <- baseline_mean + before / m
+    for (j in sample.int(length(groups))) {
+      cols <- groups[[j]]
+      coalition[, cols] <- explained[, cols, drop = FALSE]
+      after <- predict_risk(object, coalition)
+      values[, j] <- values[, j] + (after - before) / m
+      before <- after
+    }
+  }
+  # Each sampled permutation telescopes from its background prediction to f(x).
+  error <- max(abs(rowSums(values) - (target_probability - baseline_mean)))
+  if (!is.finite(error) || error > 1e-5) stop("Grouped SHAP additivity check failed")
+  values
+}
+if (file.exists(params$model_file) && file.exists(params$features_file)) {
+    features <- read.csv(params$features_file, check.names = FALSE)
+    if (!("SK_ID_CURR" %in% names(features)) || anyDuplicated(features$SK_ID_CURR) || anyNA(features$SK_ID_CURR))
+      stop("Feature matrix must have unique, nonmissing SK_ID_CURR")
+    X <- features[, setdiff(names(features), c("SK_ID_CURR", "TARGET", "p_default")), drop = FALSE]
+    if (!nrow(X) || !ncol(X)) stop("Raw feature export is empty")
+    fitted <- readRDS(params$model_file)
+    take <- sample(seq_len(nrow(X)), min(params$shap_rows, nrow(X)))
+    bg <- sample(seq_len(nrow(X)), min(params$shap_background_rows, nrow(X)))
+    check <- predict_risk(fitted, X[take[seq_len(min(20, length(take)))], , drop = FALSE])
+    if (length(check) != min(20, length(take)) || anyNA(check) || any(check < 0 | check > 1))
+      stop("Saved-model predictions are not valid TARGET=1 probabilities")
+    if (!is.null(holdout)) {
+      ix <- match(features$SK_ID_CURR[take[seq_along(check)]], holdout$SK_ID_CURR)
+      matched <- which(!is.na(ix))
+      if (length(matched) && max(abs(check[matched] - holdout$p_default[ix[matched]])) > 1e-5)
+        stop("Saved model and matching holdout scores disagree; export the original features for this fitted model")
+    }
+    if (requireNamespace("fastshap", quietly = TRUE)) {
+      shap_values <- fastshap::explain(fitted, X = X[bg, , drop = FALSE],
+        newdata = X[take, , drop = FALSE], pred_wrapper = predict_risk,
+        nsim = params$shap_nsim, adjust = TRUE, shap_only = TRUE)
+      method <- "Monte Carlo individual-feature SHAP via fastshap"
+    } else {
+      shap_values <- base_group_shap(fitted, X = X,
+        explained = X[take, , drop = FALSE], background = X[bg, , drop = FALSE],
+        nsim = params$shap_nsim, top_n = params$shap_group_top_n)
+      method <- paste0("Base R grouped permutation Shapley (",
+        sum(colnames(shap_values) != "OTHER_FEATURES"),
+        " named features; remaining features in OTHER_FEATURES)")
+    }
+    shap_summary <- sort(colMeans(abs(shap_values), na.rm = TRUE), decreasing = TRUE)
+    shap_status <- paste(method, "on", length(take), "sampled applications;",
+      length(bg), "background rows and", params$shap_nsim,
+      "Monte Carlo permutations. Values are approximate probability contributions. If exported from final_train, explanations are in sample.")
+}
+note(shap_status)
+if (!is.null(shap_summary)) {
+  top <- head(shap_summary, 12)
+  tab(data.frame(Model_feature = names(top), Mean_absolute_probability_contribution = round(unname(top), 4)),
+      "Largest mean absolute contributions; OTHER_FEATURES, if shown, pools multiple predictors")
+  leading_named <- names(shap_summary)[names(shap_summary) != "OTHER_FEATURES"]
+  if (length(leading_named)) note(paste("Across the sampled applicants,", leading_named[1],
+    "had the largest mean absolute contribution among individually named features (",
+    sprintf("%.3f", shap_summary[[leading_named[1]]]),
+    "probability units). This measures average magnitude, not the direction of risk for any applicant. OTHER_FEATURES pools several predictors and is not a denial reason."))
+  if (any(c("CODE_GENDER", "NAME_EDUCATION_TYPE") %in% names(shap_summary)))
+    note("CODE_GENDER and/or NAME_EDUCATION_TYPE appears in the SHAP ranking. Check exclusion and retraining before any credit decision; mean absolute SHAP alone cannot justify using these fields or establish fairness.")
+  old_graphics <- par(mar = c(5, 19, 4, 1))
+  barplot(rev(top), horiz = TRUE, las = 1, cex.names = .72, cex.main = .90,
+    xlab = "Mean absolute contribution to risk score",
+    main = "Approximate SHAP contributions", col = "#235789")
+  par(old_graphics)
+}
+```
+
+## Adverse action mapping
+
+These are **candidate descriptions for review**, not validated denial notices. `EXT_SOURCE_1/2/3` are external-source scores; their exact provider, input data and score direction need confirmation from the data owner. A low external score cannot automatically be called “limited history.” A reason is usable only if the actual input, direction, and applicant-level negative contribution are verified and the lender can explain it accurately to the applicant. Education and gender need special compliance review; do not use the protected attribute `CODE_GENDER` as an adverse action reason. The CFPB explains that opaque algorithms do not excuse a lender from giving accurate, specific principal reasons. [CFPB Circular 2022-03](https://www.consumerfinance.gov/compliance/circulars/circular-2022-03-adverse-action-notification-requirements-in-connection-with-credit-decisions-based-on-complex-algorithms/).
+
+| Model feature and condition to verify | Candidate customer-facing reason | Required check before use |
+|:--|:--|:--|
+| `EXT_SOURCE_MEAN` or `EXT_SOURCE_3` with verified adverse score | External credit information did not meet our underwriting criteria | The mean combines three undocumented external scores; verify each provider, underlying data, direction and individual contribution. Do not equate a low score with thin history. |
+| `INST_LATE_SHARE` high with adverse contribution | Late payments on previous loans | Confirm prior-installment records belong to this applicant, preceded this application, and have a verified late-payment definition. |
+| `BUREAU_DEBT_RATIO_MEAN` high with adverse contribution | Outstanding balances on reported loans were high relative to their original amounts | Verify credit-bureau balances, original loan amounts, recency, and actual direction. |
+| `GOODS_TO_CREDIT` with adverse contribution | Amount of credit requested relative to purchase price | Explain exact goods price and loan amount; do not assume which ratio direction is adverse without local SHAP and policy checks. |
+| `PAYMENT_RATE` with adverse contribution | Loan payment amount relative to amount borrowed | Confirm term and payment schedule; a high ratio can reflect a shorter loan, so direction requires validation. |
+| `CODE_GENDER`, `NAME_EDUCATION_TYPE` | **No customer-facing reason proposed** | These are actual top-ranked model features. Review exclusion and retraining with credit policy and compliance before any lending use. |
+
+Other technical features require a verified data dictionary and human review before mapping. For any denied applicant, identify the **actual leading risk-increasing features for that individual**, confirm their raw values, and use a reason code process approved by credit policy and legal teams. Global feature rank alone is insufficient. Correlated variables can split contributions unpredictably. Do not quote these example explanations as notices.
+
+## Fairness and group outcomes
+
+Approval rate is the share with `p_default < threshold`. The analysis reports group sizes and observed payment-difficulty rates alongside approvals to support interpretation; it does not establish why a difference exists, whether a protected group was treated lawfully, or the effect on applicants rejected under the historical policy. Education is a comparison requested for this assignment, not a substitute for protected-class data. `CODE_GENDER` has dataset-specific categories and may not reflect a person's identity. Small groups and missing categories should be interpreted cautiously. [CFPB ECOA resources](https://www.consumerfinance.gov/compliance/compliance-resources/other-applicable-requirements/equal-credit-opportunity-act/).
+
+```{r fairness, results='asis'}
+group_table <- function(d, column, cutoff) {
+  grp <- as.character(d[[column]]); grp[is.na(grp) | trimws(grp) == ""] <- "Missing"
+  splitrows <- split(seq_len(nrow(d)), grp)
+  ans <- do.call(rbind, lapply(names(splitrows), function(g) {
+    i <- splitrows[[g]]
+    data.frame(Group = g, N = length(i), Approval_rate = mean(d$p_default[i] < cutoff),
+      Observed_difficulty = mean(d$TARGET[i] == 1))
+  }))
+  ans[order(-ans$N), ]
+}
+if (is.null(assessment)) {
+  note("Group approval rates require labeled OOF or independent evaluation data.")
+} else {
+  for (column in c("CODE_GENDER", "NAME_EDUCATION_TYPE")) {
+    g <- group_table(assessment, column, threshold)
+    eligible <- g[g$N >= 30, , drop = FALSE]
+    gap <- if (nrow(eligible) >= 2L) diff(range(eligible$Approval_rate)) else NA_real_
+    g$Approval_rate <- sprintf("%.1f%%", 100 * g$Approval_rate)
+    g$Observed_difficulty <- sprintf("%.1f%%", 100 * g$Observed_difficulty)
+    tab(g, paste(assessment_kind, "group outcomes by", column))
+    if (!is.na(gap)) {
+      higher <- eligible[which.max(eligible$Approval_rate), , drop = FALSE]
+      lower <- eligible[which.min(eligible$Approval_rate), , drop = FALSE]
+      note(paste("Among", column, "groups with at least 30 applicants,",
+        higher$Group, "has the highest modeled approval rate (", pct(higher$Approval_rate),
+        ") and", lower$Group, "has the lowest (", pct(lower$Approval_rate),
+        "), a", sprintf("%.1f", 100 * gap), "percentage-point gap. Investigate sample size, risk calibration and error rates by group; this descriptive difference alone does not establish its cause or legal compliance."))
+    }
+  }
+}
+```
+
+Group gaps warrant investigation with sample sizes, uncertainty, product and market context, and review of actual policy effects. Check performance and calibration within groups. A similar approval rate alone does not prove fairness, and a different rate alone does not prove its cause. This dataset does not provide all protected-class attributes needed for a complete fair lending assessment.
+
+## Limitations, safeguards and decision
+
+1. **Label mismatch:** Kaggle predicts payment difficulty, not full default, loss severity, lifetime profit, or recovery; the unit-economics exercise assumes they coincide.
+2. **Selection and time:** training includes only labeled historical applicants; prospective applicants, policy changes and macroeconomic shifts may differ. A random cross validation fold is weaker than a later-period test for temporal drift.
+3. **Financial transfer:** 2017 international Home Credit portfolio economics and 2023 U.S. card recovery are imperfect loan-level proxies. Neither is the true cost of approving or declining a specific applicant.
+4. **Evidence gap:** the selected configuration, candidate CV results and a recorded Kaggle public AUC are documented. The OOF file can support exploratory threshold precision/recall, calibration and group comparisons when its provenance is verified; it is no substitute for an untouched holdout. Neither OOF nor Kaggle can establish realized incremental lending profit or future performance.
+5. **Explainability and law:** approximate SHAP explains score contributions, not causal reasons or valid notice text; unknown external scores and technical aggregations require source checks. Audit every feature for availability at application time, leakage and suitability.
+6. **Fair lending and access:** `CODE_GENDER` and `NAME_EDUCATION_TYPE` rank in the fitted model's top importance list. Measure group approval and error gaps; investigate direct use and proxies. Review removal of `CODE_GENDER` and treatment of education before any policy test; validate an adverse action process.
+
+**Proposed gate:** finish a locked validation set and authentic economics; independently check calibration, local explanations, subgroup metrics and application-time fields; then compare the proposed policy with the current one in a supervised pilot with appeals and ongoing monitoring. No automatic decline is authorized by this model card.
+
+## Reproduction and sources
+
+The modeling HTML records `models/final_home_credit_model.rds` as the saved artifact and `outputs/submission.csv` as the unlabeled Kaggle predictions. To calculate SHAP, export **1,200 rows of the original `final_train` frame** with `SK_ID_CURR` and every name in `final_model$preprocessor$predictors` to `outputs/model_card_features.csv`; keep the saved RDS at its original path. This sample is in sample if drawn from the fitted training data; label it accordingly. See `model_card_export_steps.md` for a copyable R chunk. The code applies the fitted preprocessor from this model's saved custom bundle. The existing `gbm` package is required; `fastshap` is optional because base R implements an approximate grouped permutation explanation.
+
+Provide `outputs/model_card_oof.csv` with `SK_ID_CURR,TARGET,p_default,CODE_GENDER,NAME_EDUCATION_TYPE` from models trained with the **final tuned configuration** that excluded each applicant scored. If there is no separate `outputs/model_card_validation.csv`, this notebook stratifies the OOF rows into a threshold-selection half and an evaluation half. The latter produces internal precision/recall, calibration, fairness, and scenario tables, but **is not an independent holdout**: earlier tuning and model choice involved overlapping applicants, and the fold models share training data. To assess an untouched holdout, separate it before model selection and fit a model excluding it; do not use the full-data final model's in-sample predictions. The QMD verifies disjoint file IDs, not how scores were produced. The 0.7670 pre-tuning candidate CV AUC and 0.761350 Kaggle score remain separately labeled. Run `quarto render model_card.qmd --to html` from the project root and review the outputs and limitations before submitting.
+
+- Mitchell et al. (2019), [Model Cards for Model Reporting](https://arxiv.org/abs/1810.03993).
+- [Hugging Face Model Card Guidebook](https://huggingface.co/docs/hub/en/model-card-guidebook); [Gemma model card](https://ai.google.dev/gemma/docs/core/model_card); [GPT-4o system card](https://openai.com/index/gpt-4o-system-card/).
+- [Home Credit B.V. 2017 annual results](https://www.homecredit.net/wp-content/uploads/2022/11/home-credit-bv-conso-results-for-year-ended-31-dec-2017.pdf), key ratios and financial results.
+- [CFPB 2023 Consumer Credit Card Market Report](https://files.consumerfinance.gov/f/documents/cfpb_consumer-credit-card-market-report_2023.pdf), §6.8, recovery experience.
+- [CFPB Circular 2022-03](https://www.consumerfinance.gov/compliance/circulars/circular-2022-03-adverse-action-notification-requirements-in-connection-with-credit-decisions-based-on-complex-algorithms/) and [ECOA resources](https://www.consumerfinance.gov/compliance/compliance-resources/other-applicable-requirements/equal-credit-opportunity-act/).
+- [Kaggle Home Credit Default Risk data](https://www.kaggle.com/competitions/home-credit-default-risk/data) and [competition metric](https://www.kaggle.com/competitions/home-credit-default-risk/overview).
