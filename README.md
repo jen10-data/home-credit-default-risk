@@ -32,7 +32,7 @@ The model comparison included logistic regression, elastic net, random forest, a
 - **Decision tradeoff:** In a provisional internal assessment, the 60.5% raw-score cutoff yielded **80.5% modeled approvals**, **20.6% precision** and **49.6% recall** among flagged applicants. These estimates depend on confirming that each out-of-fold prediction came from the **final tuned configuration** and excluded that applicant during training.
 - **Deployment gate:** Scores are substantially miscalibrated, so the raw cutoff is not a 60.5% probability of default. The model also uses `CODE_GENDER` and education fields, and modeled approval rates differ by group. It needs feature review, an untouched validation set, calibration, and a fair-lending assessment before a pilot.
 
-![Payment-difficulty rate by external-score decile in the historical training data](figures/external_scores.png)
+![Payment-difficulty rate by external-score decile in the historical training data](Home_Credit_Modeling_Assignment/figures/external_scores.png)
 
 *Exploratory association in the training data; the chart is not an individual denial reason or evidence of causality.*
 
