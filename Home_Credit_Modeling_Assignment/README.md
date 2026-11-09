@@ -1,94 +1,35 @@
-# Home Credit Default Risk
+# Home Credit Default Risk: modeling and model card
 
-This project builds and compares classification models for the Kaggle Home Credit Default Risk competition. The modeling workflow is written in lightweight R, organized as reusable functions, and explained in a literate Quarto notebook.
+**Individual project by Jenny Ngo.** This folder contains my modeling analysis for the [Home Credit Default Risk competition](https://www.kaggle.com/competitions/home-credit-default-risk) and a model card written for a lending stakeholder. The outcome is the competition's **payment-difficulty indicator**; it is not a measured loan loss. The proposed use is to support further credit-policy research and manual review, pending validation.
 
-The competition evaluates the ranking of predicted default probabilities using ROC AUC. The notebook therefore uses stratified three-fold cross-validation and selects models using out-of-sample AUC rather than accuracy.
+## File index
 
-## Modeling notebook
+| Source file | What it covers |
+| --- | --- |
+| [Modeling notebook](Home_Credit_Modeling_Assignment.qmd) | Applicant-level feature engineering, leakage-aware cross-validation, model and class-balance comparisons, hyperparameter tuning, Kaggle submission, and exports for the model card. |
+| [Model card](model_card.qmd) | Business recommendation, cost and threshold assumptions, performance, approximate SHAP explanations, potential adverse-action reasons, group comparisons, and limitations. |
+| [Model card stylesheet](model_card.css) | Formatting for the model card HTML. Keep it beside `model_card.qmd`. |
 
-For a Mac that cannot read a separate `R/` folder, use the self-contained
-[`Home_Credit_Modeling_Assignment.qmd`](Home_Credit_Modeling_Assignment.qmd).
-All reusable modeling functions are embedded in that notebook, so it does not
-call `source()` or require a separate R script.
+The modeling notebook is self-contained: its R functions are embedded in the QMD. This README does not depend on an additional `R/` directory, `notebooks/modeling.qmd`, or a score-recording script.
 
-The modular version remains available as [`notebooks/modeling.qmd`](notebooks/modeling.qmd).
-It uses the supporting script in `R/modeling_functions.R`. Both notebook versions perform the same analysis. They:
+## Results at a glance
 
-1. calculates the majority-class accuracy, ROC AUC, and precision-recall AUC;
-2. compares a focused logistic regression, elastic-net logistic regression, random forest, and gradient boosting;
-3. compares gradient boosting with no sampling, downsampling, and upsampling;
-4. uses a stratified 5,000-row sample, three-fold CV, and 20 random hyperparameter combinations to tune the best model family;
-5. compares application-only features with available applicant-level historical aggregates;
-6. fits the selected workflow on all training rows; and
-7. writes `outputs/submission.csv` with default probabilities for Kaggle.
+| Evidence | Reported result | What it means |
+| --- | ---: | --- |
+| Majority-class baseline AUC | 0.5000 | Accuracy of 0.9193 is misleading with an uncommon positive outcome. |
+| Application-only candidate, three-fold CV AUC | 0.7515 | Candidate comparison on a stratified 50,000-applicant sample. |
+| Application plus historical aggregates, three-fold CV AUC | **0.7670** | Selected **pre-tuning** feature configuration on the candidate sample. |
+| Best tuning-sample CV AUC | 0.7497 | Used to choose hyperparameters on 5,000 applicants; not a final holdout score. |
+| Final submission, Kaggle public leaderboard AUC | **0.761350** | Ranking performance on Kaggle's public evaluation subset. |
+| Final tuned configuration, pooled out-of-fold AUC | 0.7559 | Reported in the existing model-card render for a 50,000-applicant sample; verify after rerendering the attached sources. |
 
-Reusable data, preprocessing, resampling, AUC, model, tuning, importance, and submission functions are in [`R/modeling_functions.R`](R/modeling_functions.R).
+The selected model is an upsampled gradient-boosted machine using application features and available historical aggregates. Its final fit uses all selected labeled training applications. The notebook fits imputation and encoding within each validation fold and applies class balancing to training folds only. The newly added out-of-fold export fits **fold models with the final selected feature set, class strategy, and tuned parameters**; each exported applicant is scored by a fold model that excluded that applicant. Earlier model selection and tuning used overlapping labeled applicants, so these scores do **not** create an untouched holdout.
 
-The notebook deliberately avoids the packages that are unavailable on the target Mac. It relies only on base R plus:
+The model card's exploratory **60.5% raw-score cutoff** gave **80.5% modeled approvals**, **20.6% flagged-case precision**, and **49.6% flagged-case recall** in its internal assessment sample. Its **$56,637 per 1,000 assessed applications** is a proxy-economics scenario, not measured profit or improvement over the current policy. Upsampling has left the scores poorly calibrated: the cutoff is **not** a 60.5% observed default probability. The model card recommends validation before a lending-policy pilot.
 
-- `data.table` for efficient CSV input and historical aggregation;
-- `glmnet` for elastic-net logistic regression;
-- `randomForest` for random forests;
-- `gbm` for gradient boosting; and
-- `knitr` for notebook tables.
+### Notebook-maintained results
 
-Categorical predictors use training-only frequency encoding, and numeric predictors use training-only median imputation and scaling. The script itself creates stratified folds, calculates AUC, performs class resampling, runs randomized search, and extracts model-native importance.
-
-## Data
-
-Download the data only after accepting the competition rules on the [Kaggle data page](https://www.kaggle.com/competitions/home-credit-default-risk/data). Put the CSV files in `data/raw/`. Raw data are intentionally ignored by Git.
-
-Required files:
-
-- `application_train.csv`
-- `application_test.csv`
-
-Optional supplementary files detected by the notebook:
-
-- `bureau.csv`
-- `bureau_balance.csv`
-- `previous_application.csv`
-- `installments_payments.csv`
-- `POS_CASH_balance.csv`
-- `credit_card_balance.csv`
-
-The notebook also accepts browser duplicate names such as `bureau(1).csv`. If the earlier preparation workflow created prepared application files in `data/processed/`, the notebook uses those before the raw application files.
-
-The three reviewed supplementary files have the following structure:
-
-| Table | Rows | Columns | Grain |
-|---|---:|---:|---|
-| `bureau.csv` | 1,716,428 | 17 | One external bureau credit |
-| `bureau_balance.csv` | 27,299,925 | 3 | One month per external bureau credit |
-| `credit_card_balance.csv` | 3,840,312 | 23 | One month per previous Home Credit card |
-
-`bureau.csv` contains 305,811 applicants and has a unique `SK_ID_BUREAU`. `bureau_balance.csv` covers 817,395 bureau credits over months -96 through 0. `credit_card_balance.csv` covers 104,307 previous card contracts and 103,558 applicants over months -96 through -1.
-
-## Run the analysis
-
-From the repository's top-level folder:
-
-Run this once in the Positron R Console:
-
-```r
-install.packages(c("data.table", "glmnet", "randomForest", "gbm", "knitr"))
-```
-
-Then render from the Positron Terminal:
-
-```bash
-quarto render Home_Credit_Modeling_Assignment.qmd
-```
-
-The rendered assignment is created as `Home_Credit_Modeling_Assignment.html`. It is ignored by Git because the assignment instructions specify that only code should be committed. Submit the HTML separately through the course submission system.
-
-The notebook defaults to a disclosed 50,000-row stratified sample for candidate cross-validation. Set `candidate_rows: 0` to compare candidates on the complete training set. Hyperparameter tuning defaults to the required 5,000 rows, three folds, and 20 random combinations. The final model is trained on the full selected training data.
-
-`bureau_balance.csv` has more than 27 million rows, so its aggregation is disabled by default for memory-constrained computers. Change `include_bureau_balance: true` in the notebook only when enough memory is available. Other available supplementary tables are still incorporated.
-
-## Model results and selection
-
-The final README values must come from the executed notebook. They cannot be calculated until the required application train/test files are present.
+The modeling notebook updates the following block when it runs. The “best candidate” AUC here refers to the **application-only model comparison**; the separate historical-feature comparison above reports 0.7670.
 
 <!-- MODEL_RESULTS_START -->
 - Majority-class accuracy: **0.9193**
@@ -101,66 +42,38 @@ The final README values must come from the executed notebook. They cannot be cal
 - Best tuning-sample ROC AUC: **0.7497**
 <!-- MODEL_RESULTS_END -->
 
-The selection rule is fixed in advance: choose the candidate with the largest mean cross-validation ROC AUC, compare that configuration with and without available supplementary features, tune the selected family, and fit the finalized workflow on the complete training set.
+## Reproduce the analysis
 
-## Kaggle submission and score
+Run commands **inside this folder** (`Home_Credit_Modeling_Assignment/`). The QMDs use relative paths such as `data/raw`, `outputs`, and `models`; putting data only in the repository root's `data/raw` will not satisfy these defaults.
 
-After rendering, submit the locally generated file:
+1. Download the competition data from [Kaggle](https://www.kaggle.com/competitions/home-credit-default-risk/data) and place `application_train.csv` and `application_test.csv` in this folder's `data/raw/`. To reproduce the historical-aggregate result, include the supplementary CSVs you used (for example `bureau.csv`, `previous_application.csv`, `installments_payments.csv`, `POS_CASH_balance.csv`, and `credit_card_balance.csv`). The notebook discovers available sources; aggregation of the very large `bureau_balance.csv` is off by default. It may use prepared application files in `data/processed/` when present.
+2. Install the R dependencies from the **R console**:
 
-```bash
-kaggle competitions submit \
-  -c home-credit-default-risk \
-  -f outputs/submission.csv \
-  -m "Tuned Home Credit model"
-```
+   ```r
+   install.packages(c("data.table", "glmnet", "randomForest", "gbm", "knitr"))
+   ```
 
-Record the public leaderboard score in the notebook and README with:
+3. From the **terminal**, change into the modeling folder and render the notebook:
 
-```bash
-Rscript scripts/record_kaggle_score.R 0.00000 "Tuned Home Credit model"
-quarto render notebooks/modeling.qmd
-```
+   ```bash
+   cd Home_Credit_Modeling_Assignment
+   quarto render Home_Credit_Modeling_Assignment.qmd --to html
+   ```
 
-<!-- KAGGLE_SCORE_START -->
-- Public leaderboard AUC: **0.76135**
-- Submission: `Home Credit gradient boosting model`
-- Date submitted: 2026-10-11
-<!-- KAGGLE_SCORE_END -->
+   Rendering can take considerable time. With the attached updated modeling QMD, it saves `models/final_home_credit_model.rds`, `outputs/submission.csv`, `outputs/model_card_oof.csv` (50,000 labeled applicants), and `outputs/model_card_features.csv` (up to 1,200 in-sample training rows for explanation), along with intermediate outputs. Check that it finishes successfully; the model card reads these files and cannot regenerate the fitted model itself.
 
-## Files committed to GitHub
+4. Keep `model_card.qmd` and `model_card.css` in this folder. Then render:
 
-```text
-R/modeling_functions.R
-Home_Credit_Modeling_Assignment.qmd
-notebooks/modeling.qmd
-scripts/install_packages.R
-scripts/record_kaggle_score.R
-config/kaggle_score.yml
-README.md
-.gitignore
-_quarto.yml
-```
+   ```bash
+   quarto render model_card.qmd --to html
+   ```
 
-Data, prepared outputs, fitted models, resampling objects, submission files, rendered HTML, and Quarto cache files remain local through `.gitignore`.
+   The resulting `model_card.html` displays narrative, tables, and figures with code hidden. Submit that compiled HTML through the course submission system if requested. The modeling HTML is a separate technical report.
 
-## Limitations
+To submit predictions to Kaggle, use the generated `outputs/submission.csv` from **this folder**. The modeling QMD contains an old illustrative command referencing `scripts/record_kaggle_score.R` and `notebooks/modeling.qmd`; those paths do not appear in the files supplied here. The public AUC above is the recorded result, and the notebook can read an optional `config/kaggle_score.yml` with `public_auc`, `submission_name`, and `submission_date` when it exists. Do not rerun that old script command unless you have actually added those files.
 
-Cross-validation and a Kaggle public score assess discrimination on historical competition data. They do not establish probability calibration on future applicants, lending-policy impact, fairness across applicant groups, or causal effects of applicant characteristics.
+## Limits and responsible use
 
-## Model card
+The Kaggle label records payment difficulty, not a loan's lifetime profitability or recoveries. The model-card economics use sourced portfolio and credit-card recovery figures as **illustrative proxies**. Random folds and a public leaderboard score do not measure performance on future applicants. The model uses `CODE_GENDER` and `NAME_EDUCATION_TYPE`, and its modeled approval rates differ across groups; policy use needs feature review, calibration, an independent later-period evaluation, and a full fair-lending assessment. Approximate grouped SHAP contributions explain model associations; any applicant-facing adverse-action reasons require separate validation against the actual decision factors.
 
-[`model_card.qmd`](model_card.qmd) documents the selected Home Credit payment-difficulty model for a lending-policy audience. The rendered `model_card.html` is the assignment deliverable. The report includes an executive summary, the model and its intended use, cross-validation and Kaggle AUC, an exploratory decision threshold, sourced lending-cost assumptions, scenario sensitivity, approximate SHAP explanations for 1,000 sampled applicants, possible adverse-action reasons, group approval rates, and deployment limitations. The rendered report displays results with R code hidden.
-
-The selected model is an upsampled gradient-boosted machine with historical credit aggregates. The modeling notebook reports **0.7670 AUC** for the pre-tuning candidate in three-fold cross-validation and **0.761350 public Kaggle AUC** for the submitted final model. An applicant-level, 50,000-row out-of-fold (OOF) file for the final tuned configuration reports **0.7559 pooled OOF AUC**. On 25,000 OOF applicants reserved for *internal assessment*, the AUC is **0.752**. The threshold chosen on the other 25,000 OOF applicants is a **60.5% raw model score**: on the assessment half, it yields **80.5% modeled approvals**, **20.6% precision** and **49.6% recall** among flagged applicants. Under explicit proxy economics and $1,000 normalized balances, the contribution is **$56,637 per 1,000 assessed applications**. This is an illustrative scenario, **not incremental profit** relative to the current policy.
-
-The raw scores are substantially miscalibrated: in one assessment band, an average score of 64.9% corresponds to a 15.6% observed difficulty rate. The 60.5% score cutoff is therefore **not a 60.5% calibrated default probability** or an approved operating rule. Earlier model selection and tuning used overlapping labeled data, so the OOF assessment is **not an untouched holdout**. The trained model also uses `CODE_GENDER` and `NAME_EDUCATION_TYPE`; the model card recommends further validation, calibration, feature review, and a fair-lending assessment before any lending-policy pilot. The report's SHAP values are approximate grouped permutation contributions computed on an in-sample feature export.
-
-To reproduce the report from the project root, retain the fitted model at `models/final_home_credit_model.rds` and the local input files at `outputs/model_card_oof.csv` and `outputs/model_card_features.csv`, then run:
-
-```bash
-quarto render model_card.qmd --to html
-```
-
-The Quarto source uses [`model_card.css`](model_card.css) and the already-used R package `gbm`. `fastshap` is optional: the report can compute approximate grouped SHAP contributions with base R. The raw feature sample must come from the modeling workflow. Verify that each OOF prediction was generated by a fold model that excluded that applicant.
-
-Keep data, fitted models, local OOF/feature exports, and Kaggle submission files out of Git; commit the Quarto source, stylesheet and this README section. The generated HTML is for submission to the course unless the repository's policy calls for committing rendered reports.
+**GitHub portfolio:** Commit this README and the individual `.qmd` sources (and `model_card.css`). Keep raw and prepared data, `outputs/`, `models/`, prediction and submission files, cached execution files, and compiled HTML out of Git with `.gitignore`. Local generated artifacts and the submitted HTML can be retained separately. From the repository root, link to this folder's README with `[Modeling and model card](Home_Credit_Modeling_Assignment/README.md)`.
