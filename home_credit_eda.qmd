@@ -1,0 +1,541 @@
+---
+title: "Home Credit Default Risk: Exploratory Data Analysis"
+author: "Jenny Ngo"
+date: last-modified
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    toc-location: left
+    number-sections: true
+    code-fold: false
+    code-tools: true
+    embed-resources: true
+    theme: none
+    css: notebook.css
+execute:
+  echo: true
+  warning: false
+  message: false
+  error: false
+  freeze: auto
+editor: source
+---
+
+# Introduction
+
+## Business problem
+
+Home Credit serves applicants who may have limited conventional credit histories. The business needs an application-level estimate of the probability that a borrower will experience payment difficulty. A reliable estimate could help prioritize manual review, define risk tiers, and support lending-term decisions while preserving access for applicants who might be rejected by conventional underwriting. The model should support, not replace, a documented credit decision process.
+
+The analytic target is `TARGET`, where `1` identifies an application that later met Home Credit's definition of payment difficulty and `0` identifies an application that did not. The unit of analysis is one current loan application. The EDA therefore asks whether the application data are structurally valid, available at decision time, comparable between train and test, and plausibly useful for ranking repayment risk.
+
+This notebook uses only `application_train` and `application_test`, as required for this assignment. Supplementary Home Credit tables are not necessary for the conclusions below.
+
+## Questions and decisions
+
+The analysis is organized around the six required standing checks and then the business questions suggested by the business problem, data map, and feature report. Each section ends with a decision for data preparation or modeling. The notebook is descriptive: observed target-rate differences do not establish causation or justify adverse action against an applicant.
+
+| Question family | Project source | Decision it supports |
+|---|---|---|
+| Grain, keys, dictionary conflicts, and train/test compatibility | Data map and six standing checks | Valid unit of analysis and cleaning rules |
+| Missingness and temporal direction | Six standing checks and feature report | Imputation, missingness flags, and leakage control |
+| Contract type, loan amounts, and affordability ratios | Business problem statement and feature report | Product segmentation and nonlinear feature design |
+| Income, employment, and household structure | Thin-file feature report | Capacity and stability feature candidates |
+| External scores and bureau inquiries | Feature report and data dictionary | Credit-signal candidates and governance review |
+| Sensitive or proxy groups | Business problem statement and credit-risk review | Fairness audit scope and predictor restrictions |
+
+# Data and setup
+
+## What does each application table contain?
+
+`application_train` contains 307,511 labeled applications and 122 columns, including `TARGET`. `application_test` contains 48,744 unlabeled applications and the same 121 predictor columns. In both files, one row represents one current loan application and `SK_ID_CURR` is unique and non-null.
+
+The predictor columns fall into the following groups:
+
+| Column group | Examples | Role in this project |
+|---|---|---|
+| Identifier and outcome | `SK_ID_CURR`, `TARGET` | Key and labeled outcome |
+| Contract and requested amount | `NAME_CONTRACT_TYPE`, `AMT_CREDIT`, `AMT_ANNUITY`, `AMT_GOODS_PRICE` | Product and proposed obligation |
+| Income and employment | `AMT_INCOME_TOTAL`, `NAME_INCOME_TYPE`, `DAYS_EMPLOYED`, `OCCUPATION_TYPE`, `ORGANIZATION_TYPE` | Capacity and stability proxies |
+| Household and demographics | `CNT_CHILDREN`, `CNT_FAM_MEMBERS`, `DAYS_BIRTH`, `NAME_FAMILY_STATUS`, `CODE_GENDER` | Household context and audit attributes |
+| Assets, housing, and region | `FLAG_OWN_CAR`, `FLAG_OWN_REALTY`, housing measurements, region ratings | Stability and collateral proxies |
+| External risk scores | `EXT_SOURCE_1`, `EXT_SOURCE_2`, `EXT_SOURCE_3` | Third-party or composite risk signals |
+| Documents and contact flags | `FLAG_DOCUMENT_*`, phone and email flags | Application completeness and contactability |
+| Bureau inquiries | `AMT_REQ_CREDIT_BUREAU_*` | Recent credit-seeking activity |
+| Relative-time fields | `DAYS_REGISTRATION`, `DAYS_ID_PUBLISH`, `DAYS_LAST_PHONE_CHANGE` | Recency and tenure proxies |
+
+Two dictionary conflicts require explicit treatment. `DAYS_EMPLOYED=365243` appears even though employment days should be non-positive, and the test file contains one `REGION_RATING_CLIENT_W_CITY=-1` although the documented domain is 1–3. Undocumented placeholders such as `XNA` and `Unknown` are treated as unknown categories rather than ordinary values.
+
+```{r}
+#| label: setup
+#| include: true
+
+# Read the two required application tables without changing source column names.
+train_path <- file.path("application_train.csv")
+test_path  <- file.path("application_test.csv")
+train <- read.csv(train_path, check.names = FALSE, na.strings = c("", "NA"))
+test  <- read.csv(test_path,  check.names = FALSE, na.strings = c("", "NA"))
+
+# Helper: create quantile groups while tolerating repeated cut points.
+quantile_group <- function(x, groups = 10) {
+  breaks <- unique(quantile(x, probs = seq(0, 1, length.out = groups + 1),
+                            na.rm = TRUE, type = 7))
+  cut(x, breaks = breaks, include.lowest = TRUE, ordered_result = TRUE)
+}
+
+# Helper: summarize count and TARGET rate by a grouping variable.
+target_summary <- function(group, target = train$TARGET) {
+  keep <- !is.na(group) & !is.na(target)
+  n <- tapply(target[keep], group[keep], length)
+  events <- tapply(target[keep], group[keep], sum)
+  data.frame(group = names(n), n = as.integer(n),
+             target_count = as.integer(events),
+             target_rate = as.numeric(events / n))
+}
+```
+
+# Standing checks
+
+## What is the target distribution?
+
+```{r}
+#| label: target-distribution
+
+# Count labeled outcomes and calculate their shares.
+target_count <- table(train$TARGET, useNA = "ifany")
+target_table <- data.frame(
+  TARGET = names(target_count),
+  count = as.integer(target_count),
+  share = as.numeric(prop.table(target_count))
+)
+
+# Save a labeled figure used in the rendered report.
+png("figures/target_distribution.png", width = 1332, height = 756, res = 180)
+barplot(100 * target_table$share,
+        names.arg = c("No payment difficulty\n(TARGET = 0)",
+                      "Payment difficulty\n(TARGET = 1)"),
+        col = c("#2C5F8A", "#D9822B"), ylim = c(0, 100),
+        main = "Training target distribution",
+        xlab = "Observed outcome", ylab = "Share of applications (%)")
+dev.off()
+```
+
+![Training target distribution](figures/target_distribution.png){fig-alt="Bar chart showing that 91.93 percent of training applications have TARGET zero and 8.07 percent have TARGET one."}
+
+| TARGET | Applications | Share |
+|---:|---:|---:|
+| 0 | 282,686 | 91.93% |
+| 1 | 24,825 | 8.07% |
+
+**Interpretation and decision.** Payment difficulty occurs in 8.07% of labeled applications, and the majority class is 11.39 times the minority class. Accuracy alone would reward a useless majority-class model. Model development will use stratified splits and evaluate ranking and calibration with ROC AUC, precision-recall measures, calibration plots, and threshold-specific business tradeoffs.
+
+## How much data are missing, and is missingness related to the target?
+
+```{r}
+#| label: missingness
+
+# Calculate overall and target-specific missingness for every predictor.
+predictors <- setdiff(names(train), "TARGET")
+missing_overall <- sapply(train[predictors], function(x) mean(is.na(x)))
+missing_t0 <- sapply(train[train$TARGET == 0, predictors], function(x) mean(is.na(x)))
+missing_t1 <- sapply(train[train$TARGET == 1, predictors], function(x) mean(is.na(x)))
+missing_table <- data.frame(
+  column = predictors,
+  overall = missing_overall,
+  target_0 = missing_t0,
+  target_1 = missing_t1,
+  difference = missing_t1 - missing_t0,
+  row.names = NULL
+)
+missing_table <- missing_table[order(-missing_table$overall), ]
+```
+
+![Missingness by target](figures/missingness_by_target.png){fig-alt="Horizontal grouped bars showing higher missingness for TARGET one than TARGET zero in the ten most incomplete columns."}
+
+| Column family | Highest missing rate | Example target-rate contrast |
+|---|---:|---|
+| Common-area measures | 69.87% | 8.57% when missing vs. 6.91% when observed |
+| Nonliving-apartment measures | 69.43% | 8.58% when missing vs. 6.91% when observed |
+| Building-fund type | 68.39% | 8.62% when missing vs. 6.89% when observed |
+| Living-apartment measures | 68.35% | 8.62% when missing vs. 6.89% when observed |
+| Car age | 65.99% | 8.50% when missing vs. 7.24% when observed |
+
+**Interpretation and decision.** Missingness is extensive and informative. It is concentrated in property features, and several missing groups have different payment-difficulty rates from observed groups. Missingness cannot be treated as random or replaced blindly with a global mean. Preparation will retain missingness indicators for high-missingness and business-relevant fields, learn any imputation parameters on the training fold only, and compare performance with models that handle missing values directly.
+
+## Which values are impossible, sentinel-coded, or outside the documented domain?
+
+```{r}
+#| label: impossible-values
+
+# Count the known employment sentinel and the out-of-domain region rating.
+integrity_counts <- data.frame(
+  check = c("DAYS_EMPLOYED = 365243 (train)",
+            "DAYS_EMPLOYED = 365243 (test)",
+            "REGION_RATING_CLIENT_W_CITY < 0 (train)",
+            "REGION_RATING_CLIENT_W_CITY < 0 (test)"),
+  count = c(sum(train$DAYS_EMPLOYED == 365243, na.rm = TRUE),
+            sum(test$DAYS_EMPLOYED == 365243, na.rm = TRUE),
+            sum(train$REGION_RATING_CLIENT_W_CITY < 0, na.rm = TRUE),
+            sum(test$REGION_RATING_CLIENT_W_CITY < 0, na.rm = TRUE))
+)
+
+# Apply broad semantic checks after removing the employment sentinel.
+train$DAYS_EMPLOYED_CLEAN <- ifelse(train$DAYS_EMPLOYED == 365243,
+                                    NA, train$DAYS_EMPLOYED)
+test$DAYS_EMPLOYED_CLEAN <- ifelse(test$DAYS_EMPLOYED == 365243,
+                                   NA, test$DAYS_EMPLOYED)
+```
+
+| Check | Train | Test | Decision |
+|---|---:|---:|---|
+| `DAYS_EMPLOYED=365243` | 55,374 | 9,274 | Recode to missing and add a sentinel flag |
+| `REGION_RATING_CLIENT_W_CITY=-1` | 0 | 1 | Map to unknown/missing before factor encoding |
+| `CODE_GENDER='XNA'` | 4 | 0 | Preserve as unknown for audit; do not treat as a substantive level |
+| `NAME_FAMILY_STATUS='Unknown'` | 2 | 0 | Preserve as unknown and combine rare levels if modeled |
+| Nonpositive income, credit, annuity, or goods price | 0 | 0 | No correction needed |
+| Age outside 18–100 years | 0 | 0 | No correction needed |
+| Employment longer than age after sentinel removal | 0 | 0 | No correction needed |
+| Car age below 0 or above 100 | 0 | 0 | No correction needed |
+
+The largest income is 117,000,000, far above the 99.9th percentile of 900,000. It is extreme but not logically impossible.
+
+**Interpretation and decision.** The sentinel and domain violations would distort tenure and factor encoding if left untreated. They will be converted to missing or explicit unknown states, with flags retained where the missing mechanism may carry information. Extreme monetary values will not be deleted automatically; log transformations, robust scaling, and sensitivity checks will be used, with any capping threshold learned from the training fold.
+
+## Are the keys unique, are there duplicates, and what is the grain?
+
+```{r}
+#| label: keys-and-grain
+
+# Verify that each application key is present once and that partitions do not overlap.
+key_check <- data.frame(
+  table = c("application_train", "application_test"),
+  rows = c(nrow(train), nrow(test)),
+  distinct_ids = c(length(unique(train$SK_ID_CURR)),
+                   length(unique(test$SK_ID_CURR))),
+  null_ids = c(sum(is.na(train$SK_ID_CURR)), sum(is.na(test$SK_ID_CURR))),
+  duplicate_ids = c(sum(duplicated(train$SK_ID_CURR)),
+                    sum(duplicated(test$SK_ID_CURR)))
+)
+id_overlap <- length(intersect(train$SK_ID_CURR, test$SK_ID_CURR))
+```
+
+| Table | Grain | Rows | Distinct `SK_ID_CURR` | Null keys | Duplicate keys |
+|---|---|---:|---:|---:|---:|
+| `application_train` | One current loan application | 307,511 | 307,511 | 0 | 0 |
+| `application_test` | One current loan application | 48,744 | 48,744 | 0 | 0 |
+
+The train and test key sets have zero overlap.
+
+**Interpretation and decision.** Both tables satisfy application-level key integrity and can be modeled without aggregation. `SK_ID_CURR` will remain an identifier and will not be used as a predictor. The application grain does not prove one row per person, so this EDA makes no person-level independence claim.
+
+## Which fields were known at application time?
+
+```{r}
+#| label: temporal-direction
+
+# Screen columns by their documented role and relative-time naming pattern.
+relative_time <- grep("^DAYS_|^AMT_REQ_CREDIT_BUREAU_", names(train), value = TRUE)
+temporal_screen <- data.frame(
+  class = c("Outcome", "Relative-time or pre-application by description",
+            "Application snapshot; exact source timestamp unresolved"),
+  column_count = c(1, length(relative_time),
+                   ncol(train) - 1 - length(relative_time))
+)
+```
+
+| Temporal class | Columns | Finding |
+|---|---:|---|
+| Outcome | 1 | `TARGET` is not a predictor |
+| Relative-time or pre-application by name/dictionary | 11 | Direction appears safe, but source timestamps remain undocumented |
+| Application snapshot with unresolved source timing | 110 | Availability at the exact decision point is not proven |
+
+**Interpretation and decision.** No predictor is proven to contain the outcome, but column names alone cannot establish point-in-time availability. `TARGET` will be excluded. The remaining fields are provisionally eligible only for this academic analysis; production use would require a field-level lineage review, especially for external scores and fields that may be refreshed after submission.
+
+## Are train and test consistent in columns, types, and category levels?
+
+```{r}
+#| label: train-test-consistency
+
+# Compare predictor names and inferred base-R classes.
+train_predictors <- setdiff(names(train), "TARGET")
+train_only <- setdiff(train_predictors, names(test))
+test_only <- setdiff(names(test), train_predictors)
+shared <- intersect(train_predictors, names(test))
+type_mismatch <- shared[sapply(shared, function(x) {
+  class(train[[x]])[1] != class(test[[x]])[1]
+})]
+
+# Compare categorical levels after converting values to character.
+categorical <- shared[sapply(train[shared], function(x) is.character(x) || is.factor(x))]
+level_differences <- lapply(categorical, function(x) list(
+  train_only = setdiff(unique(as.character(train[[x]])),
+                       unique(as.character(test[[x]]))),
+  test_only = setdiff(unique(as.character(test[[x]])),
+                      unique(as.character(train[[x]])))
+))
+names(level_differences) <- categorical
+```
+
+| Measure | Result |
+|---|---:|
+| Shared predictors | 121 |
+| Train-only predictor columns | 0 |
+| Test-only predictor columns | 0 |
+| Inferred type mismatches | 0 |
+
+| Column | Train-only level | Test-only level |
+|---|---|---|
+| `CODE_GENDER` | `XNA` | None |
+| `NAME_FAMILY_STATUS` | `Unknown` | None |
+| `NAME_INCOME_TYPE` | `Maternity leave` | None |
+| `REGION_RATING_CLIENT_W_CITY` | None | `-1` |
+
+![Train and test drift screen](figures/train_test_drift.png){fig-alt="Horizontal bars of PSI or total variation distance for selected predictors, with contract type, EXT_SOURCE_1, and credit above the review threshold."}
+
+**Interpretation and decision.** The schema matches, but factor domains and several selected distributions do not. `NAME_CONTRACT_TYPE`, `EXT_SOURCE_1`, and `AMT_CREDIT` exceed the 0.05 drift-screen threshold; `EXT_SOURCE_1` coverage is 43.62% in train and 57.88% in test. Preprocessing will define a shared unknown category, learn encodings from training data, and monitor these fields in validation. Drift is a warning about generalization, not a reason to edit the test set.
+
+# Exploratory results
+
+## Does payment difficulty differ between cash and revolving loans?
+
+```{r}
+#| label: contract-type
+
+# Summarize payment difficulty by contract type.
+contract_rate <- target_summary(train$NAME_CONTRACT_TYPE)
+
+# Write the labeled comparison plot.
+png("figures/contract_type.png", width = 1296, height = 774, res = 180)
+barplot(100 * contract_rate$target_rate,
+        names.arg = contract_rate$group, col = c("#2C5F8A", "#D9822B"),
+        ylim = c(0, 10), main = "Payment difficulty differs by contract type",
+        xlab = "Contract type", ylab = "Payment-difficulty rate (%)")
+dev.off()
+```
+
+![Payment difficulty by contract type](figures/contract_type.png){fig-alt="Cash loans have an 8.35 percent payment-difficulty rate and revolving loans have a 5.48 percent rate."}
+
+| Contract type | Applications | Payment-difficulty rate |
+|---|---:|---:|
+| Cash loans | 278,232 | 8.35% |
+| Revolving loans | 29,279 | 5.48% |
+
+**Interpretation and decision.** Cash-loan applications have a 2.87 percentage-point higher observed target rate than revolving loans. Product rules, applicant mix, and loan structure could all create the difference. Contract type will be retained, and validation will test contract interactions or product-specific calibration rather than assuming one common baseline risk.
+
+## How does payment difficulty change across credit and annuity ranges?
+
+```{r}
+#| label: loan-amount-ranges
+
+# Form deciles independently for requested credit and proposed annuity.
+credit_decile <- quantile_group(train$AMT_CREDIT)
+annuity_decile <- quantile_group(train$AMT_ANNUITY)
+credit_rate <- target_summary(credit_decile)
+annuity_rate <- target_summary(annuity_decile)
+```
+
+![Target rate across loan amount deciles](figures/amount_deciles.png){fig-alt="Two line charts showing curved, non-monotonic target rates across requested-credit and annuity deciles."}
+
+| Measure | Lowest-decile rate | Peak rate and location | Highest-decile rate |
+|---|---:|---|---:|
+| Requested credit | 6.72% | 10.52%, sixth decile | 5.33% |
+| Proposed annuity | 7.10% | 10.08%, seventh decile | 5.78% |
+
+**Interpretation and decision.** Neither monetary relationship is linear. Midrange applications have the highest observed rates, while the highest-value applications have lower rates, possibly reflecting selection, income, product, or underwriting differences. The model will use nonlinear treatment such as splines, monotonicity-free binning, or tree-based learners and will validate interactions with income and contract type.
+
+## How does payment difficulty vary with proposed payment burden?
+
+```{r}
+#| label: affordability-ratios
+
+# Create two affordability proxies after checking for valid income denominators.
+valid_income <- !is.na(train$AMT_INCOME_TOTAL) & train$AMT_INCOME_TOTAL > 0
+annuity_income <- ifelse(valid_income,
+                         train$AMT_ANNUITY / train$AMT_INCOME_TOTAL, NA)
+credit_income <- ifelse(valid_income,
+                        train$AMT_CREDIT / train$AMT_INCOME_TOTAL, NA)
+annuity_burden_rate <- target_summary(quantile_group(annuity_income))
+credit_burden_rate <- target_summary(quantile_group(credit_income))
+```
+
+![Target rate across affordability ratio deciles](figures/burden_deciles.png){fig-alt="Two line charts showing target rate across annuity-to-income and credit-to-income deciles; both rise and then fall."}
+
+| Proxy | Lowest-decile rate | Peak rate | Highest-decile rate |
+|---|---:|---:|---:|
+| Annuity / income | 7.14% | 8.85% | 8.19% |
+| Credit / income | 6.91% | 9.20% | 7.07% |
+
+**Interpretation and decision.** Both ratios show a curved pattern, not a simple increase in risk with burden. Selection effects and mismatched time units may explain part of the pattern: the dictionary does not establish whether annuity and income use directly comparable periods. These ratios will be retained only as provisional affordability proxies, modeled nonlinearly, and relabeled after unit confirmation.
+
+## Do income and employment tenure show different target patterns?
+
+```{r}
+#| label: income-employment
+
+# Use a log-friendly positive income measure and remove the employment sentinel.
+income_decile <- quantile_group(train$AMT_INCOME_TOTAL)
+tenure_decile <- quantile_group(train$DAYS_EMPLOYED_CLEAN)
+income_rate <- target_summary(income_decile)
+tenure_rate <- target_summary(tenure_decile)
+```
+
+![Target rate by income and employment tenure](figures/income_employment.png){fig-alt="Two line charts showing lower payment difficulty in the highest income decile and much lower difficulty among applicants with the longest employment tenure."}
+
+| Finding | Observed rates |
+|---|---|
+| Income | 8.19% in the lowest decile; 6.14% in the highest decile; not strictly monotonic |
+| Employment tenure | 4.56% in the longest-tenure decile; about 11% in the shortest-tenure deciles |
+| Large income groups | Working 9.59%; commercial associate 7.48%; state servant 5.75%; pensioner 5.39% |
+| Selected occupations | Low-skill laborers 17.15%; drivers 11.33%; accountants 4.83% |
+
+**Interpretation and decision.** Shorter employment tenure separates risk more clearly than raw income. Income, occupation, and employer sector also differ, but category-level rates can reflect applicant mix and sparse groups. Clean tenure and log income will be candidate predictors. Rare categories will be pooled based on training data, and employment categories will receive stability and fairness review before use.
+
+## Does household size remain associated with payment difficulty after considering income and burden?
+
+```{r}
+#| label: household-size
+
+# Fit a descriptive logistic model with standardized numeric predictors.
+household <- data.frame(
+  TARGET = train$TARGET,
+  family_members = train$CNT_FAM_MEMBERS,
+  children = train$CNT_CHILDREN,
+  log_income = log1p(train$AMT_INCOME_TOTAL),
+  annuity_income = annuity_income
+)
+household_complete <- household[complete.cases(household), ]
+household_scaled <- as.data.frame(scale(household_complete[-1]))
+household_model <- glm(household_complete$TARGET ~ ., data = household_scaled,
+                       family = binomial())
+household_odds_ratios <- exp(coef(household_model)[-1])
+```
+
+| Measure | Low-count group | High-count group | Descriptive adjusted result |
+|---|---|---|---|
+| Family members | 2 members: 7.58% | 6+ members: 13.18% | OR 0.879 per 1 SD when children are also included |
+| Children | 0 children: 7.71% | 4 children: 12.82% | OR 1.198 per 1 SD |
+
+**Interpretation and decision.** Larger child counts are associated with higher target rates after the descriptive adjustment, but family-member and child counts overlap structurally and the largest households are rare. Both variables can remain candidates with capped or grouped tails. Their incremental value, stability, and fairness implications must be tested; the coefficients are associations, not causal effects.
+
+## Does payment difficulty decrease consistently as each external score increases?
+
+```{r}
+#| label: external-scores
+
+# Calculate decile target rates separately for each external score.
+external_rate <- lapply(c("EXT_SOURCE_1", "EXT_SOURCE_2", "EXT_SOURCE_3"),
+                        function(column) {
+  rates <- target_summary(quantile_group(train[[column]]))
+  rates$score <- column
+  rates$decile <- seq_len(nrow(rates))
+  rates
+})
+external_rate <- do.call(rbind, external_rate)
+```
+
+![Target rate across external-score deciles](figures/external_scores.png){fig-alt="Three lines decline in every successive external-score decile, from about 18 to 20 percent in the lowest decile to about 3 percent in the highest."}
+
+| Score | Lowest-decile rate | Highest-decile rate | Missing share | Missing-group target rate |
+|---|---:|---:|---:|---:|
+| `EXT_SOURCE_1` | 17.56% | 2.57% | 56.38% | 8.52% |
+| `EXT_SOURCE_2` | 18.35% | 2.97% | 0.21% | 7.88% |
+| `EXT_SOURCE_3` | 20.00% | 3.23% | 19.83% | 9.31% |
+
+**Interpretation and decision.** All three external scores show perfectly decreasing decile target rates, making them the strongest univariate relationships examined. Their provenance, construction, and application-time availability are not documented here, and `EXT_SOURCE_1` has major train/test coverage drift. They are high-priority candidates only after governance approval; missing indicators, nonlinear calibration, and stability tests are mandatory.
+
+## Are recent bureau inquiries associated with payment difficulty, and which window is strongest?
+
+```{r}
+#| label: bureau-inquiries
+
+# Compare inquiry windows using rank correlation and a simple univariate AUC.
+inquiry_columns <- paste0("AMT_REQ_CREDIT_BUREAU_",
+                          c("HOUR", "DAY", "WEEK", "MON", "QRT", "YEAR"))
+
+auc_rank <- function(score, outcome) {
+  keep <- complete.cases(score, outcome)
+  score <- score[keep]; outcome <- outcome[keep]
+  n1 <- sum(outcome == 1); n0 <- sum(outcome == 0)
+  (sum(rank(score)[outcome == 1]) - n1 * (n1 + 1) / 2) / (n1 * n0)
+}
+
+inquiry_screen <- data.frame(
+  window = sub("AMT_REQ_CREDIT_BUREAU_", "", inquiry_columns),
+  missing_rate = sapply(train[inquiry_columns], function(x) mean(is.na(x))),
+  auc = sapply(train[inquiry_columns], auc_rank, outcome = train$TARGET),
+  spearman = sapply(train[inquiry_columns], function(x)
+    cor(x, train$TARGET, method = "spearman", use = "complete.obs"))
+)
+```
+
+![Bureau inquiry univariate screen](figures/bureau_inquiries.png){fig-alt="Horizontal bars show yearly inquiries with AUC 0.5206 and all other windows close to 0.5."}
+
+| Window | Missing share | Univariate AUC | Spearman correlation |
+|---|---:|---:|---:|
+| Year | 13.50% | 0.5206 | 0.0195 |
+| Day | 13.50% | 0.5007 | 0.0049 |
+| Week | 13.50% | 0.5002 | 0.0007 |
+| Hour | 13.50% | 0.5001 | 0.0010 |
+| Month | 13.50% | 0.4952 | -0.0069 |
+| Quarter | 13.50% | 0.4937 | -0.0085 |
+
+**Interpretation and decision.** The yearly inquiry count is the strongest window, but its AUC of 0.5206 is weak in isolation. All six fields share 13.50% missingness, and their windows overlap. The yearly count and an inquiry-missingness indicator will enter candidate development; shorter windows will be retained only if cross-validated incremental value justifies their redundancy.
+
+## Do data availability and outcomes differ across sensitive or proxy groups?
+
+```{r}
+#| label: subgroup-audit
+
+# Audit outcome and data availability by gender without treating it as causal.
+gender_audit <- do.call(rbind, lapply(split(train, train$CODE_GENDER), function(d) {
+  data.frame(
+    group = unique(d$CODE_GENDER), n = nrow(d),
+    target_rate = mean(d$TARGET),
+    ext1_missing = mean(is.na(d$EXT_SOURCE_1)),
+    ext3_missing = mean(is.na(d$EXT_SOURCE_3)),
+    occupation_missing = mean(is.na(d$OCCUPATION_TYPE))
+  )
+}))
+```
+
+| Gender code | Applications | Target rate | `EXT_SOURCE_1` missing | `EXT_SOURCE_3` missing | Occupation missing |
+|---|---:|---:|---:|---:|---:|
+| F | 202,448 | 7.00% | 54.73% | 19.07% | 36.14% |
+| M | 105,059 | 10.14% | 59.56% | 21.28% | 22.10% |
+| XNA | 4 | 0.00% | 50.00% | 0.00% | 50.00% |
+
+**Interpretation and decision.** Outcome prevalence and feature availability differ across gender codes, so aggregate model performance could conceal unequal error or missingness burdens. This table does not explain why the differences occur. Gender, family status, age, and closely related attributes will be treated as audit variables unless legal and policy review explicitly authorizes another use. Later modeling must compare calibration, error rates, selection rates, and missingness handling across sufficiently large groups.
+
+# Results and project decisions
+
+The EDA supports a predictive classification approach, but it changes the preparation and validation plan in material ways.
+
+| EDA finding | Evidence | Project decision |
+|---|---|---|
+| The target is imbalanced | 8.07% positive; 11.39:1 majority-to-minority ratio | Use stratified splits and class-aware ranking, calibration, and threshold metrics |
+| Missingness is both heavy and informative | Property fields approach 70% missing; missing groups often have different target rates | Retain selected missingness indicators and learn imputation only within training folds |
+| Sentinel and domain violations exist | 55,374 train and 9,274 test employment sentinels; one test region rating of -1 | Recode to missing/unknown and preserve flags where useful |
+| Application keys are sound | Unique, non-null `SK_ID_CURR`; zero train/test overlap | Model at application grain and exclude the identifier from predictors |
+| Point-in-time lineage is incomplete | Exact source timing is unresolved for 110 columns | Require lineage approval before production use, especially for external scores |
+| Train/test drift is present | Contract type, `EXT_SOURCE_1`, and credit exceed the drift screen | Use training-derived preprocessing and monitor validation stability |
+| Several useful relationships are nonlinear | Loan amounts and burden ratios rise and then fall across deciles | Avoid linear-only assumptions; test splines, bins, interactions, or tree models |
+| External scores are strongest descriptively | Each score declines monotonically from roughly 18–20% to roughly 3% target rate | Prioritize only after provenance review; retain missingness treatment and calibration checks |
+| Employment tenure is informative | 4.56% in the longest-tenure decile versus about 11% in the shortest | Clean the sentinel and retain tenure as a nonlinear candidate |
+| Sensitive-group outcomes and coverage differ | Gender-code target and missingness rates differ | Reserve sensitive attributes for auditing and test group performance before deployment |
+
+The EDA confirms the business problem's core premise: application-time information can rank repayment difficulty, including for applicants with incomplete records. It also narrows the claim. The available data represent observed Home Credit applications, not the full population of potential or rejected borrowers, so the analysis cannot prove that a model expands access or generalizes to previously rejected applicants. Those benefits require separate policy design, reject-inference analysis, and post-deployment monitoring.
+
+The next modeling stage should compare a transparent regularized logistic model with a nonlinear tree-based model. Both should use identical leakage-controlled folds, training-only preprocessing, probability calibration, and threshold analysis based on the costs of missed difficult-payment cases and unnecessary declines or reviews. Strong univariate patterns are candidates, not final underwriting rules.
+
+# Use of AI
+
+AI assistance was used to organize the original question list, translate it into a dependency-ordered EDA plan, draft and revise code, identify missing rubric elements, and challenge the interpretations from the perspective of a skeptical credit-risk reviewer. 
+
+The process was useful for coverage and consistency, but it required human-style verification. Earlier drafts overemphasized missing supplementary tables even though they were optional, reported outputs without decisions, and did not distinguish association from causation strongly enough. Every numerical claim in this version was checked against the supplied CSV-derived results, and the final decisions were kept separate from the descriptive evidence. 
+
+# Sources
+
+- Home Credit. [Home Credit Default Risk competition data](https://www.kaggle.com/competitions/home-credit-default-risk/data).
+- Home Credit application-table dictionary, as rendered in the [`risk3r` documentation](https://jkunst.com/risk3r/reference/home_credit_application.html).
+- Project artifacts: `data_map.md`, `feature_report.md`, the approved EDA plan, and the executed CSV results.
